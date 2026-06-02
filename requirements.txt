@@ -4,5 +4,5 @@ google_api_python_client==2.6.0
 huggingface_hub==1.16.4
 instaloader==4.15.1
 protobuf==7.35.0
-pydantic==1.10.15
+pydantic>=1.10.15
 uvicorn==0.48.0

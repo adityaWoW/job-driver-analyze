@@ -520,13 +520,14 @@ def run_job(req: SpreadsheetRequest):
 def trigger_automatic_job():
     """Fungsi yang dipanggil otomatis oleh scheduler secara berkala"""
     global current_job_req
-    if current_job_req is None:
-        print("[CRON] Gagal menjalankan job otomatis: Parameter req kosong.")
+    
+    if current_job_req is None or not getattr(current_job_req, "spreadsheet_id", "").strip():
+        print("[CRON] Job otomatis dilewati: Belum ada spreadsheet_id yang tersimpan di memori (aplikasi mungkin baru di-restart).")
         return
 
     print(f"[CRON] Memulai job otomatis terjadwal pada {time.strftime('%Y-%m-%d %H:%M:%S')}")
     
-    # Cek apakah job sebelumnya masih jalan, jika tidak, jalankan run_job
+    # 2. Cek status running
     if not job_status["running"]:
         run_job(current_job_req)
     else:

@@ -12,9 +12,13 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from typing import Optional, List
 from threading import Lock
+from apscheduler.schedulers.background import BackgroundScheduler
 
 from google.oauth2 import service_account
 from googleapiclient.discovery import build
+
+scheduler = BackgroundScheduler()
+current_job_req = None
 
 # ─── FASTAPI APP ─────────────────────────────────────────────
 app = FastAPI(title="IG View Worker")
@@ -513,12 +517,28 @@ def run_job(req: SpreadsheetRequest):
         job_status["running"]  = False
         job_status["last_run"] = time.strftime("%Y-%m-%d %H:%M:%S")
 
+def trigger_automatic_job():
+    """Fungsi yang dipanggil otomatis oleh scheduler secara berkala"""
+    global current_job_req
+    if current_job_req is None:
+        print("[CRON] Gagal menjalankan job otomatis: Parameter req kosong.")
+        return
+
+    print(f"[CRON] Memulai job otomatis terjadwal pada {time.strftime('%Y-%m-%d %H:%M:%S')}")
+    
+    # Cek apakah job sebelumnya masih jalan, jika tidak, jalankan run_job
+    if not job_status["running"]:
+        run_job(current_job_req)
+    else:
+        print("[CRON] Job otomatis dilewati karena job sebelumnya masih berjalan.")
+
 
 # ─── ENDPOINTS ───────────────────────────────────────────────
 
 @app.get("/")
 def root():
     return {"status": "ok", "message": "IG View Worker is running"}
+
 
 @app.post("/api/instagram/save-session")
 async def save_instagram_session(payload: dict):
@@ -571,7 +591,8 @@ async def save_instagram_session(payload: dict):
 # ── 2. Terima spreadsheet & jalankan job otomatis ─────────────
 @app.post("/spreadSheet")
 async def spreadsheet_job(req: SpreadsheetRequest, background_tasks: BackgroundTasks):
-    # Validasi session tersedia
+    global current_job_req
+    
     cookies_raw = os.environ.get("INSTAGRAM_COOKIES", "")
     if not cookies_raw:
         raise HTTPException(
@@ -595,7 +616,22 @@ async def spreadsheet_job(req: SpreadsheetRequest, background_tasks: BackgroundT
             detail="Job sedang berjalan. Tunggu hingga selesai.",
         )
 
+    current_job_req = req
     background_tasks.add_task(run_job, req)
+
+    if not scheduler.get_job('automatic_ig_job'):
+        if not scheduler.running:
+            scheduler.start()
+            
+        scheduler.add_job(
+            trigger_automatic_job, 
+            'interval', 
+            minutes=30, 
+            id='automatic_ig_job'
+        )
+        print(f"🔥 [SCHEDULER] Berhasil diaktifkan! Seterusnya job akan jalan tiap 30 menit otomatis.")
+    else:
+        print(f"ℹ️ [SCHEDULER] Sudah aktif sebelumnya, menggunakan parameter spreadsheet terbaru.")
 
     return {
         "message":        "Job dimulai.",
@@ -603,6 +639,22 @@ async def spreadsheet_job(req: SpreadsheetRequest, background_tasks: BackgroundT
         "sheet_name":     req.sheet_name,
         "status":         "started",
     }
+
+def trigger_automatic_job():
+    """Fungsi yang dipanggil otomatis oleh scheduler secara berkala"""
+    global current_job_req
+    if current_job_req is None:
+        print("[CRON] Gagal menjalankan job otomatis: Parameter req kosong.")
+        return
+
+    print(f"[CRON] Memulai job otomatis terjadwal pada {time.strftime('%Y-%m-%d %H:%M:%S')}")
+    
+    # Cek apakah job sebelumnya masih jalan, jika tidak, jalankan run_job
+    if not job_status["running"]:
+        # Karena run_job adalah fungsi sinkron biasa, bisa langsung dipanggil
+        run_job(current_job_req)
+    else:
+        print("[CRON] Job otomatis dilewati karena job sebelumnya masih berjalan.")
 
 
 # ── 3. Polling status ─────────────────────────────────────────
@@ -683,6 +735,12 @@ async def restart_job(req: SpreadsheetRequest, background_tasks: BackgroundTasks
         "sheet_name":     req.sheet_name,
         "status":         "restarted",
     }
+
+@app.on_event("shutdown")
+def shutdown_event():
+    if scheduler.running:
+        scheduler.shutdown()
+        print("[SHUTDOWN] Scheduler dimatikan dengan bersih.")
 
 # ─── ENTRYPOINT ──────────────────────────────────────────────
 if __name__ == "__main__":

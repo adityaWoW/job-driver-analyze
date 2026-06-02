@@ -146,11 +146,11 @@ def get_loader() -> instaloader.Instaloader:
         })
         L.context.username = IG_USERNAME
 
-        try:
-            L.context.graphql_query("d6f4427fbe92d846298cf93df0b937d3", {})
-            print(f"✅ Session aktif — login sebagai: {IG_USERNAME}")
-        except Exception as e:
-            print(f"⚠️ Verifikasi session gagal ({e}). Melanjutkan...")
+        # try:
+        #     L.context.graphql_query("d6f4427fbe92d846298cf93df0b937d3", {})
+        #     print(f"✅ Session aktif — login sebagai: {IG_USERNAME}")
+        # except Exception as e:
+        #     print(f"⚠️ Verifikasi session gagal ({e}). Melanjutkan...")
 
         _loader_instance = L
         return L
@@ -428,7 +428,7 @@ def run_job(req: SpreadsheetRequest):
                 break
 
             # 🔥 ANTI-BOT 2: Human-like delay acak sebelum hit API (8 - 16 detik)
-            time.sleep(random.uniform(5.0, 9.0))
+            time.sleep(random.uniform(10.0, 15.0))
 
             total_views, views_organik, status, is_boosted_api = fetch_single_sequential(url, loader)
             if status == "stopped":
@@ -466,8 +466,8 @@ def run_job(req: SpreadsheetRequest):
             log(f"  ✓ [{processed_count}/{total}] Selesai analisa baris {gs_row} | Status: {status_label}")
 
             # 🔥 ANTI-BOT 3: Ambil jeda istirahat panjang (Coffee Break) setiap 7 - 12 item
-            if processed_count % random.randint(15, 25) == 0 and processed_count < total:
-                sleep_break = random.uniform(10, 15)
+            if processed_count % random.randint(10, 18) == 0 and processed_count < total:
+                sleep_break = random.uniform(40, 70)
                 log(f"☕ [ANTI-BAN] Mengambil istirahat sejenak selama {sleep_break:.1f} detik...")
                 time.sleep(sleep_break)
 
@@ -589,7 +589,7 @@ async def spreadsheet_job(req: SpreadsheetRequest, background_tasks: BackgroundT
         scheduler.add_job(
             trigger_automatic_job, 
             'interval', 
-            minutes=45, 
+            minutes=120, 
             id='automatic_ig_job'
         )
         print(f"🔥 [SCHEDULER] Berhasil diaktifkan! Berjalan otomatis per 45 menit.")

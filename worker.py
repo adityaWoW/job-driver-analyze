@@ -21,7 +21,7 @@ app = FastAPI(title="IG View Worker")
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=["https://analisis-data-instagram-fe.vercel.app"],
     allow_methods=["*"],
     allow_headers=["*"],
 )

@@ -657,7 +657,32 @@ async def startup_event():
         reset_loader()
     else:
         print("[STARTUP] INSTAGRAM_COOKIES belum ada. Tunggu save-session dari extension.")
+        
+@app.post("/api/job/restart")
+async def restart_job(req: SpreadsheetRequest, background_tasks: BackgroundTasks):
+    """
+    Menghentikan paksa status running saat ini jika ada, 
+    kemudian menjalankan ulang job baru dari awal.
+    """
+    cookies_raw = os.environ.get("INSTAGRAM_COOKIES", "")
+    if not cookies_raw:
+        raise HTTPException(
+            status_code=401,
+            detail="Session Instagram belum tersedia. Silakan login terlebih dahulu.",
+        )
+    with job_lock:
+        job_status["running"] = False
+        time.sleep(0.5) 
 
+    # Tambahkan task baru ke background
+    background_tasks.add_task(run_job, req)
+
+    return {
+        "message":        "Job berhasil di-restart dari awal.",
+        "spreadsheet_id": req.spreadsheet_id,
+        "sheet_name":     req.sheet_name,
+        "status":         "restarted",
+    }
 
 # ─── ENTRYPOINT ──────────────────────────────────────────────
 if __name__ == "__main__":

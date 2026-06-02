@@ -270,7 +270,7 @@ def fetch_single_sequential(url: str, loader: instaloader.Instaloader) -> tuple:
                 return total_views, views_organik, "ok", is_boosted
 
             if attempt == 0:
-                retry_delay = random.uniform(15.0, 25.0)
+                retry_delay = random.uniform(10.0, 15.0)
                 print(f"  [RETRY] {shortcode} bernilai 0, menunggu {retry_delay:.1f}s...")
                 time.sleep(retry_delay)
 
@@ -428,7 +428,7 @@ def run_job(req: SpreadsheetRequest):
                 break
 
             # 🔥 ANTI-BOT 2: Human-like delay acak sebelum hit API (8 - 16 detik)
-            time.sleep(random.uniform(8.0, 16.0))
+            time.sleep(random.uniform(5.0, 9.0))
 
             total_views, views_organik, status, is_boosted_api = fetch_single_sequential(url, loader)
             if status == "stopped":
@@ -466,8 +466,8 @@ def run_job(req: SpreadsheetRequest):
             log(f"  ✓ [{processed_count}/{total}] Selesai analisa baris {gs_row} | Status: {status_label}")
 
             # 🔥 ANTI-BOT 3: Ambil jeda istirahat panjang (Coffee Break) setiap 7 - 12 item
-            if processed_count % random.randint(7, 12) == 0 and processed_count < total:
-                sleep_break = random.uniform(40.0, 75.0)
+            if processed_count % random.randint(15, 25) == 0 and processed_count < total:
+                sleep_break = random.uniform(10, 15)
                 log(f"☕ [ANTI-BAN] Mengambil istirahat sejenak selama {sleep_break:.1f} detik...")
                 time.sleep(sleep_break)
 

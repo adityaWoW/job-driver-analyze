@@ -491,13 +491,15 @@ def trigger_automatic_job():
     """Fungsi yang dipanggil otomatis oleh scheduler secara berkala"""
     global current_job_req
     
+    # PERBAIKAN: Validasi ketat agar tidak menjalankan job jika spreadsheet_id kosong
     if current_job_req is None or not getattr(current_job_req, "spreadsheet_id", "").strip():
-        print("[CRON] Job otomatis dilewati: Belum ada spreadsheet_id yang tersimpan di memori.")
+        print("[CRON] Job otomatis dilewati: Parameter spreadsheet_id kosong atau belum tersimpan.")
         return
 
     print(f"[CRON] Memulai job otomatis terjadwal pada {time.strftime('%Y-%m-%d %H:%M:%S')}")
     
     if not job_status["running"]:
+        # Pastikan data req dioper dengan benar dan utuh
         run_job(current_job_req)
     else:
         print("[CRON] Job otomatis dilewati karena job sebelumnya masih berjalan.")
@@ -649,16 +651,29 @@ async def startup_event():
 
 @app.post("/api/job/restart")
 async def restart_job(req: SpreadsheetRequest, background_tasks: BackgroundTasks):
+    global current_job_req  # Tambahkan global agar mereferensikan variabel utama
+    
     cookies_raw = os.environ.get("INSTAGRAM_COOKIES", "")
     if not cookies_raw:
         raise HTTPException(
             status_code=401,
             detail="Session Instagram belum tersedia. Silakan login terlebih dahulu.",
         )
+        
+    # Validasi tambahan untuk memastikan ID tidak kosong dari request baru
+    if not req.spreadsheet_id or not req.spreadsheet_id.strip():
+        raise HTTPException(
+            status_code=400,
+            detail="Spreadsheet ID tidak boleh kosong.",
+        )
+
     with job_lock:
         job_status["running"] = False
         time.sleep(1.0) 
 
+    # PERBAIKAN: Simpan request terbaru ke state global agar dikenali oleh scheduler/cron job
+    current_job_req = req
+    
     background_tasks.add_task(run_job, req)
 
     return {

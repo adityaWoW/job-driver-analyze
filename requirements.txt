@@ -1,0 +1,4 @@
+google_api_python_client>=2.6.0
+instaloader>=4.15.1
+protobuf>=7.35.0
+schedule>=1.2.2

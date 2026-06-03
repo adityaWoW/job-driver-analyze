@@ -13,6 +13,7 @@ from typing import Optional
 from threading import Lock
 from apscheduler.schedulers.background import BackgroundScheduler
 from datetime import datetime, timedelta
+from zoneinfo import ZoneInfo
 
 from google.oauth2 import service_account
 from googleapiclient.discovery import build
@@ -404,7 +405,7 @@ def run_job(req: SpreadsheetRequest):
             update_sheet_values(service, req.spreadsheet_id, updates_header)
 
         # ── Filter baris yang perlu diproses ──
-        now = datetime.now()
+        now = datetime.now(ZoneInfo("Asia/Jakarta")).replace(tzinfo=None)
         expiry = timedelta(hours=24)
         _ts_re = re.compile(r"\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}")
 
@@ -466,7 +467,7 @@ def run_job(req: SpreadsheetRequest):
                     is_boosted = True
                     views_organik = int(total_views * 0.4) if total_views else 0
 
-            ts    = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            ts    = datetime.now(ZoneInfo("Asia/Jakarta")).strftime("%Y-%m-%d %H:%M:%S")
             label = f"[BOOSTED] {ts}" if is_boosted else f"[ORGANIC] {ts}"
             gs_row = idx + 2
 
@@ -512,7 +513,7 @@ def run_job(req: SpreadsheetRequest):
         log(f"[ERROR] {e}")
     finally:
         job_status["running"]  = False
-        job_status["last_run"] = time.strftime("%Y-%m-%d %H:%M:%S")
+        job_status["last_run"] = datetime.now(ZoneInfo("Asia/Jakarta")).strftime("%Y-%m-%d %H:%M:%S")
 
 
 def trigger_automatic_job():
@@ -521,7 +522,7 @@ def trigger_automatic_job():
         print("[CRON] Dilewati: spreadsheet_id kosong.")
         return
     if not job_status["running"]:
-        print(f"[CRON] Auto-job {time.strftime('%Y-%m-%d %H:%M:%S')}")
+        print(f"[CRON] Auto-job {datetime.now(ZoneInfo('Asia/Jakarta')).strftime('%Y-%m-%d %H:%M:%S')} WIB")
         run_job(current_job_req)
     else:
         print("[CRON] Dilewati: job masih berjalan.")
@@ -617,6 +618,7 @@ async def restart_job(req: SpreadsheetRequest, background_tasks: BackgroundTasks
     global current_job_req
     _validate_session()
     if not req.spreadsheet_id.strip():
+        print("DEBUG DATA SPREADSHEET_ID:", repr(req.spreadsheet_id))
         raise HTTPException(status_code=400, detail="Spreadsheet ID tidak boleh kosong.")
 
     with job_lock:
@@ -663,7 +665,7 @@ async def startup_event():
 
 
 @app.on_event("shutdown")
-def shutdown_event():
+async def shutdown_event():
     if scheduler.running:
         scheduler.shutdown()
         print("[SHUTDOWN] Scheduler dimatikan.")

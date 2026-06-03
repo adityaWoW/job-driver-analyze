@@ -2,7 +2,6 @@ import os
 import json
 import time
 import random
-import asyncio
 import threading
 import instaloader
 import re
@@ -13,6 +12,7 @@ from pydantic import BaseModel
 from typing import Optional, List
 from threading import Lock
 from apscheduler.schedulers.background import BackgroundScheduler
+from datetime import datetime, timedelta
 
 from google.oauth2 import service_account
 from googleapiclient.discovery import build
@@ -207,6 +207,13 @@ def fetch_fresh_post(shortcode: str, loader: instaloader.Instaloader):
 def get_views_from_post(post) -> tuple[int, int, bool]:
     raw       = getattr(post, "_full_metadata", {}) or {}
     shortcode = raw.get("code", "unknown")
+    boost_flags = ["is_ad", "is_boosted_post", "is_commercial", "is_paid_partnership"]
+
+    print(f"\n🔍 [DEBUG FLAGS] Memeriksa URL Shortcode: {shortcode}")
+    for flag in boost_flags:
+        # Menggunakan raw.get(flag, "Tidak Ditemukan") untuk tahu apakah key-nya ada atau tidak
+        status_flag = raw.get(flag, "Tidak Ditemukan")
+        print(f"   └── {flag}: {status_flag} (Tipe: {type(status_flag).__name__})")
 
     if not raw.get("is_video", True) and raw.get("__typename") != "GraphVideo":
         likes_count = (
@@ -230,11 +237,15 @@ def get_views_from_post(post) -> tuple[int, int, bool]:
     views_organik = raw.get("video_view_count", 0)
 
     is_boosted  = False
-    boost_flags = ["is_ad", "is_boosted_post", "is_commercial", "is_paid_partnership"]
+    
     for flag in boost_flags:
         val = raw.get(flag)
         if val is True:
             is_boosted = True
+
+    print(f"   [INFO] Tipe Media: VIDEO/REEL")
+    print(f"   [INFO] Hasil Deteksi Akhir -> Is Boosted: {is_boosted}")
+    print(f"   [INFO] Total Views: {total_views} | Views Organik (Raw): {views_organik}\n")
 
     if is_boosted:
         if not (0 < views_organik < total_views):
@@ -347,6 +358,7 @@ def log(msg: str):
 def run_job(req: SpreadsheetRequest):
     with job_lock:
         if job_status["running"]:
+            log("[JOB] Job dilewati: Sesi analisis sebelumnya masih aktif berjalan.")
             return
         job_status.update({
             "running":   True,
@@ -370,11 +382,11 @@ def run_job(req: SpreadsheetRequest):
         data_rows = raw_rows[1:]
 
         # ── Deteksi kolom ──
-        col_link       = next((i for i, c in enumerate(header) if "link post"                     in c.lower()), None)
-        col_imp        = next((i for i, c in enumerate(header) if "total imp by job"              in c.lower()), None)
-        col_imp_ori    = next((i for i, c in enumerate(header) if "total imp organik"             in c.lower()), None)
-        col_status_idx = next((i for i, c in enumerate(header) if "status(job)"                 in c.lower()), None)
-        col_boost      = next((i for i, c in enumerate(header) if "boost"                         in c.lower()), None)
+        col_link       = next((i for i, c in enumerate(header) if "link post" in c.lower()), None)
+        col_imp        = next((i for i, c in enumerate(header) if "total imp by job" in c.lower()), None)
+        col_imp_ori    = next((i for i, c in enumerate(header) if "total imp organik" in c.lower()), None)
+        col_status_idx = next((i for i, c in enumerate(header) if "status(job)" in c.lower()), None)
+        col_boost      = next((i for i, c in enumerate(header) if "boost" in c.lower()), None)
 
         if col_link is None:
             log("[JOB] Kolom 'link post' tidak ditemukan!")
@@ -399,36 +411,63 @@ def run_job(req: SpreadsheetRequest):
         if updates_header:
             update_sheet_values(service, req.spreadsheet_id, updates_header)
 
-        # ── Kumpulkan URL valid ──
-        url_index_pairs = [
-            (i, row[col_link].strip())
-            for i, row in enumerate(data_rows)
-            if col_link < len(row) and "instagram.com" in str(row[col_link])
-        ]
+        # ── LOGIKA EVALUASI WAKTU KEDALUWARSA (24 JAM) ──
+        waktu_sekarang = datetime.now()
+        batas_kedaluwarsa = timedelta(hours=24) 
 
-        total = len(url_index_pairs)
-        job_status["total"] = total
+        url_index_pairs = []
+        for i, row in enumerate(data_rows):
+            if col_link >= len(row) or "instagram.com" not in str(row[col_link]):
+                continue
+            
+            perlu_proses = True
+            
+            if col_status_idx is not None and col_status_idx < len(row):
+                status_raw = str(row[col_status_idx]).strip()
+                
+                # Cek apakah kolom berisi label [ORGANIC] atau [BOOSTED]
+                if "[ORGANIC]" in status_raw or "[BOOSTED]" in status_raw:
+                    # Coba ekstrak timestamp dari teks (Format: [STATUS] YYYY-MM-DD HH:MM:SS)
+                    match = re.search(r"\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}", status_raw)
+                    if match:
+                        try:
+                            waktu_job_lalu = datetime.strptime(match.group(0), "%Y-%m-%d %H:%M:%S")
+                            # Jika selisih waktu sekarang dengan waktu lalu BELUM melewati 2 jam, maka SKIP
+                            if waktu_sekarang - waktu_job_lalu < batas_kedaluwarsa:
+                                perlu_proses = False
+                        except ValueError:
+                            pass # Format tanggal korup/salah, paksa proses ulang
+
+            if perlu_proses:
+                url_index_pairs.append((i, row[col_link].strip()))
+
+        total_antrean = len(url_index_pairs)
+        job_status["total"] = total_antrean
 
         if not url_index_pairs:
-            log("[JOB] Tidak ada URL Instagram valid.")
+            log("[JOB] Selesai. Semua baris data masih segar (belum melewati batas 24 jam).")
             return
 
-        # 🔥 ANTI-BOT 1: Acak urutan URL agar target perayapan tidak linier kebawah
-        random.shuffle(url_index_pairs)
-        log(f"[JOB] {total} URL siap diproses sekuensial dengan rotasi User-Agent...")
+        # Ambil sesuai ukuran batch agar Instagram tidak memblokir IP/Akun Anda
+        limit = req.batch_size if req.batch_size else 50
+        processing_pool = url_index_pairs[:limit]
+        
+        # Diacak agar pola hit ke Instagram tidak berurutan konstan (pola bot)
+        random.shuffle(processing_pool)
+        
+        log(f"[JOB] Ditemukan {total_antrean} data kedaluwarsa/baru. Memproses batch ini sebanyak {len(processing_pool)} URL.")
 
         bulk_updates = []
         processed_count = 0
 
-        # Loop satu per satu (Sekuensial)
-        for idx, url in url_index_pairs:
-            # Cek interupsi tombol STOP dari user
+        # Loop pemrosesan data (Sekuensial)
+        for idx, url in processing_pool:
             if not job_status["running"]:
                 log("[JOB] Dihentikan paksa oleh user.")
                 break
 
-            # 🔥 ANTI-BOT 2: Human-like delay acak sebelum hit API (8 - 16 detik)
-            time.sleep(random.uniform(10.0, 15.0))
+            # Jeda fluktuatif anti-bot (10-18 detik)
+            time.sleep(random.uniform(10.0, 18.0))
 
             total_views, views_organik, status, is_boosted_api = fetch_single_sequential(url, loader)
             if status == "stopped":
@@ -442,10 +481,11 @@ def run_job(req: SpreadsheetRequest):
                     is_boosted    = True
                     views_organik = int(total_views * 0.4) if total_views else 0
 
-            status_label = "[BOOSTED]" if is_boosted else "[ORGANIC]"
+            # ── FORMAT BARU: Menyisipkan waktu pengerjaan ──
+            timestamp_sekarang = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            status_label = f"[BOOSTED] {timestamp_sekarang}" if is_boosted else f"[ORGANIC] {timestamp_sekarang}"
             gs_row       = idx + 2 
 
-            # Kumpulkan data ke dalam memori lokal, TIDAK LANGSUNG ditulis ke Drive
             if col_imp is not None:
                 bulk_updates.append({
                     "range":  f"'{req.sheet_name}'!{col_letter(col_imp)}{gs_row}",
@@ -462,22 +502,22 @@ def run_job(req: SpreadsheetRequest):
 
             processed_count += 1
             job_status["processed"] = processed_count
-            job_status["progress"]  = round(processed_count / total * 100)
-            log(f"  ✓ [{processed_count}/{total}] Selesai analisa baris {gs_row} | Status: {status_label}")
+            job_status["progress"]  = round(processed_count / len(processing_pool) * 100)
+            log(f"  ✓ [{processed_count}/{len(processing_pool)}] Sukses analisa baris {gs_row} -> {status_label}")
 
-            # 🔥 ANTI-BOT 3: Ambil jeda istirahat panjang (Coffee Break) setiap 7 - 12 item
-            if processed_count % random.randint(10, 18) == 0 and processed_count < total:
-                sleep_break = random.uniform(40, 70)
+            # Jeda istirahat kopi (Coffee break) jika memproses banyak data
+            if processed_count % random.randint(8, 14) == 0 and processed_count < len(processing_pool):
+                sleep_break = random.uniform(30, 60)
                 log(f"☕ [ANTI-BAN] Mengambil istirahat sejenak selama {sleep_break:.1f} detik...")
                 time.sleep(sleep_break)
 
-        # ── 🔥 ONE-TIME WRITE: Kirim ke Google Drive hanya saat seluruh proses telah selesai ──
+        # ── SIMPAN PER BATCH ──
         if bulk_updates:
-            log(f"[WRITE] Memulai sinkronisasi akhir ke Google Drive ({len(bulk_updates)} cells)...")
+            log(f"[WRITE] Menyimpan pembaruan batch ke Google Sheets ({len(bulk_updates)} cells)...")
             update_sheet_values(service, req.spreadsheet_id, bulk_updates)
-            log("[WRITE] Sukses! Seluruh data analisis telah diperbarui di Google Sheets.")
+            log("[WRITE] Sinkronisasi data baru berhasil disimpan.")
         else:
-            log("[WRITE] Selesai tanpa ada data yang diperbarui.")
+            log("[WRITE] Tidak ada perubahan data.")
 
     except Exception as e:
         job_status["error"] = str(e)
@@ -585,14 +625,13 @@ async def spreadsheet_job(req: SpreadsheetRequest, background_tasks: BackgroundT
         if not scheduler.running:
             scheduler.start()
             
-        # Dinaikkan menjadi 45 menit agar akun memiliki nafas/istirahat antar siklus cron job
         scheduler.add_job(
             trigger_automatic_job, 
             'interval', 
-            minutes=120, 
+            hours=24, 
             id='automatic_ig_job'
         )
-        print(f"🔥 [SCHEDULER] Berhasil diaktifkan! Berjalan otomatis per 45 menit.")
+        print(f"🔥 [SCHEDULER] Berhasil diaktifkan! Berjalan otomatis per 24 Jam.")
     else:
         print(f"ℹ️ [SCHEDULER] Menggunakan parameter spreadsheet terbaru.")
 

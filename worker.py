@@ -19,6 +19,7 @@ from googleapiclient.discovery import build
 
 scheduler = BackgroundScheduler()
 current_job_req = None
+_consecutive_conn_errors = 0
 
 app = FastAPI(title="IG View Worker")
 app.add_middleware(
@@ -288,11 +289,12 @@ def get_views_from_post(post) -> tuple[int, int, bool]:
 
 
 def fetch_single_sequential(url: str, loader: instaloader.Instaloader) -> tuple:
+    global _consecutive_conn_errors
+
     shortcode = extract_shortcode(url)
     if not shortcode:
         return 0, 0, "invalid_url", False
 
-    # ✅ OPTIMASI: skip shortcode yang sudah gagal terlalu sering
     fail_count = _failed_shortcodes.get(shortcode, 0)
     if fail_count >= MAX_FAIL_COUNT:
         print(f"  [SKIP] {shortcode} sudah gagal {fail_count}x, dilewati.")
@@ -305,8 +307,8 @@ def fetch_single_sequential(url: str, loader: instaloader.Instaloader) -> tuple:
             post = fetch_fresh_post(shortcode, loader)
             total_views, views_organik, is_boosted = get_views_from_post(post)
             if total_views > 0:
-                # Reset counter gagal jika berhasil
                 _failed_shortcodes.pop(shortcode, None)
+                _consecutive_conn_errors = 0  # reset karena berhasil
                 return total_views, views_organik, "ok", is_boosted
 
             if attempt == 0:
@@ -315,11 +317,33 @@ def fetch_single_sequential(url: str, loader: instaloader.Instaloader) -> tuple:
                 time.sleep(delay)
 
         except Exception as e:
-            print(f"  ✗ {shortcode} attempt {attempt + 1}: {type(e).__name__}")
-            if attempt == 0:
-                time.sleep(12)
+            err_name = type(e).__name__
 
-    # Catat kegagalan
+            # ✅ PERBAIKAN: tangani ConnectionException secara khusus
+            if "ConnectionException" in err_name or "ConnectionError" in err_name:
+                _consecutive_conn_errors += 1
+                print(f"  [CONN-ERR] {shortcode} attempt {attempt+1}: {err_name} "
+                      f"(beruntun ke-{_consecutive_conn_errors})")
+
+                if attempt == 0:
+                    # Jeda lebih panjang khusus ConnectionError
+                    wait = random.uniform(20, 35)
+                    print(f"  [CONN-ERR] Mundur {wait:.0f}s sebelum retry...")
+                    time.sleep(wait)
+
+                # Jika ConnectionError sudah 3x beruntun lintas URL → reset loader
+                if _consecutive_conn_errors >= 3:
+                    extra_wait = random.uniform(45, 75)
+                    print(f"  [CONN-RESET] {_consecutive_conn_errors}x beruntun! "
+                          f"Jeda {extra_wait:.0f}s lalu reset loader...")
+                    time.sleep(extra_wait)
+                    reset_loader()
+                    _consecutive_conn_errors = 0
+            else:
+                print(f"  ✗ {shortcode} attempt {attempt + 1}: {err_name}")
+                if attempt == 0:
+                    time.sleep(12)
+
     _failed_shortcodes[shortcode] = _failed_shortcodes.get(shortcode, 0) + 1
     return 0, 0, "error", False
 
@@ -532,6 +556,14 @@ def run_job(req: SpreadsheetRequest):
             else:
                 consecutive_success = 0
 
+            if status not in ("ok",) or total_views == 0:
+                log(f"  ✗ [{processed_count+1}/{limit}] baris {idx+2} GAGAL ({status}), "
+                    f"dilewati — akan dicoba ulang run berikutnya.")
+                processed_count += 1
+                job_status["processed"] = processed_count
+                job_status["progress"]  = round(processed_count / limit * 100)
+                continue  # ← langsung ke URL berikutnya, tidak tulis apapun
+
             # ✅ OPTIMASI: boost_val sudah diekstrak saat filter, tidak perlu akses data_rows lagi
             is_boosted = is_boosted_api
             if boost_val in {"yes", "y", "true", "boosting", "1"}:
@@ -540,7 +572,7 @@ def run_job(req: SpreadsheetRequest):
 
             ts     = _wib_now_str()
             label  = f"[BOOSTED] {ts}" if is_boosted else f"[ORGANIC] {ts}"
-            gs_row = idx + 2  # +1 header, +1 karena Sheets 1-indexed
+            gs_row = idx + 2 
 
             if col_imp is not None:
                 bulk_updates.append({

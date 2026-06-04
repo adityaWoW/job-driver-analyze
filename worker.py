@@ -353,20 +353,23 @@ def run_job(req: SpreadsheetRequest):
         service = get_sheets_service(req.google_credentials)
         loader  = get_loader()
 
-        header_raw = get_sheet_values(service, req.spreadsheet_id, f"'{req.sheet_name}'!1:1")
-        if not header_raw:
+        raw_rows = get_sheet_values(service, req.spreadsheet_id, f"'{req.sheet_name}'!A1:ZZ")
+        if not raw_rows:
             log("[JOB] Sheet kosong, skip.")
             return
-        header = header_raw[0]
 
+        header    = raw_rows[0]
+        data_rows = raw_rows[1:]
+
+        # ── Deteksi kolom (satu pass) ──
         col_map = {}
         for i, c in enumerate(header):
             cl = c.lower()
-            if "link post" in cl:           col_map["link"]    = i
-            elif "total imp by job" in cl:  col_map["imp"]     = i
-            elif "total imp organik" in cl: col_map["imp_ori"] = i
-            elif "status(job)" in cl:       col_map["status"]  = i
-            elif "boost" in cl:             col_map["boost"]   = i
+            if "link post" in cl:            col_map["link"]    = i
+            elif "total imp by job" in cl:   col_map["imp"]     = i
+            elif "total imp organik" in cl:  col_map["imp_ori"] = i
+            elif "status(job)" in cl:        col_map["status"]  = i
+            elif "boost" in cl:              col_map["boost"]   = i
 
         if "link" not in col_map:
             log("[JOB] Kolom 'link post' tidak ditemukan!")
@@ -378,6 +381,7 @@ def run_job(req: SpreadsheetRequest):
         col_status_idx = col_map.get("status")
         col_boost      = col_map.get("boost")
 
+        # ── Tambah kolom baru jika perlu ──
         updates_header = []
         if col_imp_ori is None:
             col_imp_ori = len(header)
@@ -396,148 +400,148 @@ def run_job(req: SpreadsheetRequest):
         if updates_header:
             update_sheet_values(service, req.spreadsheet_id, updates_header)
 
-        needed_cols = sorted(set(filter(None.__ne__, [col_link, col_imp, col_imp_ori, col_status_idx, col_boost])))
-        col_ranges = ",".join(f"'{req.sheet_name}'!{col_letter(c)}2:{col_letter(c)}" for c in needed_cols)
-        batch_result = service.spreadsheets().values().batchGet(
-            spreadsheetId=req.spreadsheet_id, ranges=col_ranges.split(","),
-        ).execute()
-
-        value_ranges = batch_result.get("valueRanges", [])
-        col_data: dict[int, list] = {}
-        for vi, col_idx in enumerate(needed_cols):
-            values = value_ranges[vi].get("values", []) if vi < len(value_ranges) else []
-            col_data[col_idx] = [row[0] if row else "" for row in values]
-
-        total_rows = len(col_data.get(col_link, []))
-        now    = _wib_now()
+        # ── Filter baris yang perlu diproses ──
+        now    = datetime.now(ZoneInfo("Asia/Jakarta")).replace(tzinfo=None)
         expiry = timedelta(hours=24)
-        
-        url_index_pairs: list[tuple[int, str, str]] = []
+        _ts_re = re.compile(r"\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}")
 
-        for i in range(total_rows):
-            cell_link = col_data.get(col_link, [""] * total_rows)
-            url_val   = cell_link[i] if i < len(cell_link) else ""
-
-            if "instagram.com" not in str(url_val):
+        url_index_pairs = []
+        for i, row in enumerate(data_rows):
+            if col_link >= len(row) or "instagram.com" not in str(row[col_link]):
                 continue
 
-            status_raw = ""
-            if col_status_idx is not None:
-                status_col = col_data.get(col_status_idx, [])
-                status_raw = str(status_col[i]).strip() if i < len(status_col) else ""
-
-            # ── PERBAIKAN LOGIKA UTAMA ──
-            need_process = False
-            
-            if status_raw == "":
-                # Aturan 1: Kolom status kosong WAJIB diproses
-                need_process = True
-            else:
-                # Aturan 2: Jika terisi, cek apakah umurnya sudah lebih dari 24 jam
-                m = _TS_RE.search(status_raw)
-                if m:
-                    try:
-                        last_run = datetime.strptime(m.group(0), "%Y-%m-%d %H:%M:%S")
-                        if now - last_run >= expiry:
-                            need_process = True  # Sudah lewat 24 jam, proses lagi
-                    except ValueError:
-                        need_process = True  # Format tanggal rusak, anggap butuh diproses
+            need_process = True
+            if col_status_idx is not None and col_status_idx < len(row):
+                status_raw = str(row[col_status_idx]).strip()
+                if "[ORGANIC]" in status_raw or "[BOOSTED]" in status_raw:
+                    m = _ts_re.search(status_raw)
+                    if m:
+                        try:
+                            last_run = datetime.strptime(m.group(0), "%Y-%m-%d %H:%M:%S")
+                            if now - last_run < expiry:
+                                need_process = False
+                        except ValueError:
+                            pass
 
             if need_process:
-                boost_col = col_data.get(col_boost, []) if col_boost is not None else []
-                boost_val = str(boost_col[i]).strip().lower() if i < len(boost_col) else ""
-                url_index_pairs.append((i, url_val.strip(), boost_val))
+                # KUNCI PERBAIKAN: Ikat indeks list (i) dan baris Google Sheets asli (i + 2) bersama URL
+                url_index_pairs.append((i, i + 2, row[col_link].strip()))
 
         total_antrean = len(url_index_pairs)
         job_status["total"] = total_antrean
 
         if not url_index_pairs:
-            log("[JOB] Selesai. Semua data kosong telah diproses & data lama masih segar (<24 jam).")
+            log("[JOB] Selesai. Semua data masih segar (<24 jam).")
             return
 
-        # Ambil pooling data sesuai batch size (misal 100 - 300)
-        pool_size = min(req.batch_size or 100, total_antrean)
-        raw_pool = random.sample(url_index_pairs, pool_size)
-        
+        # ── Filter URL tidak valid SEBELUM loop utama & Ambil Sampel Acak ──
         valid_pool = []
-        for idx, url, boost_val in raw_pool:
+        skipped = 0
+        
+        # Mengacak antrean secara aman dengan mempertahankan relasi indeks dan baris GS asli
+        sampled_pairs = random.sample(url_index_pairs, min(req.batch_size or 50, total_antrean))
+        
+        for idx, gs_line, url in sampled_pairs:
             if extract_shortcode(url):
-                valid_pool.append((idx, url, boost_val))
+                valid_pool.append((idx, gs_line, url))
+            else:
+                skipped += 1
+                log(f"  ⚠️ Skip URL tidak valid: {url}")
+
+        if skipped:
+            log(f"[JOB] {skipped} URL dilewati (format tidak valid).")
 
         limit = len(valid_pool)
         if not valid_pool:
             log("[JOB] Tidak ada URL valid untuk diproses.")
             return
 
-        log(f"[JOB] Ditemukan {total_antrean} data siap diproses. Memproses batch sebanyak {limit} data.")
+        log(f"[JOB] {total_antrean} kedaluwarsa. Memproses {limit} URL valid batch ini.")
 
-        bulk_updates = []
-        processed_count = 0
-        
-        # ── OPTIMASI MULTI-THREADING (MEMPERCEPAT BACA URL) ──
-        # Menggunakan max_workers=4 agar cepat (paralel) namun aman dari ban Instagram
-        MAX_WORKERS = 2
-        
-        def worker_task(item):
-            idx, url, boost_val = item
-            # Berikan sedikit jeda acak awal antar thread agar tidak menembak bersamaan
-            time.sleep(random.uniform(3.0, 7.5))
+        bulk_updates        = []
+        processed_count     = 0
+        consecutive_success = 0    # ← tracker untuk jeda adaptif
+        CHECKPOINT_EVERY    = 15
+
+        # ── Loop utama — Sinkronisasi Posisi Baris Terjamin ──
+        for idx, gs_row, url in valid_pool:
+            if not job_status["running"]:
+                log("[JOB] Dihentikan paksa.")
+                break
+
+            # Jeda adaptif anti-bot tetap dipertahankan
+            if consecutive_success >= 3:
+                delay = random.uniform(5.0, 9.0)
+            else:
+                delay = random.uniform(10.0, 16.0)
+            time.sleep(delay)
+
             total_views, views_organik, status, is_boosted_api = fetch_single_sequential(url, loader)
-            return (idx, url, boost_val, total_views, views_organik, status, is_boosted_api)
 
-        with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
-            futures = [executor.submit(worker_task, item) for item in valid_pool]
-            
-            for future in as_completed(futures):
-                if not job_status["running"]:
-                    log("[JOB] Dihentikan paksa oleh pengguna.")
-                    break
-                
-                idx, url, boost_val, total_views, views_organik, status, is_boosted_api = future.result()
-                processed_count += 1
-                job_status["processed"] = processed_count
-                job_status["progress"]  = round(processed_count / limit * 100)
+            if status == "stopped":
+                break
 
-                if status != "ok" or total_views == 0:
-                    log(f" ✗ [{processed_count}/{limit}] Baris {idx+2} GAGAL ({status}).")
-                    continue
+            # Update streak sukses
+            if status == "ok":
+                consecutive_success += 1
+            else:
+                consecutive_success = 0
 
-                # Proses pendeteksian Boosting
-                is_boosted = is_boosted_api
-                if boost_val in {"yes", "y", "true", "boosting", "1"}:
+            # Override dari kolom boost manual berdasarkan indeks baris memori asli yang tepat
+            is_boosted = is_boosted_api
+            if col_boost is not None and col_boost < len(data_rows[idx]):
+                val = str(data_rows[idx][col_boost]).strip().lower()
+                if val in {"yes", "y", "true", "boosting", "1"}:
                     is_boosted    = True
                     views_organik = int(total_views * 0.4) if total_views else 0
 
-                ts     = _wib_now_str()
-                label  = f"[BOOSTED] {ts}" if is_boosted else f"[ORGANIC] {ts}"
-                gs_row = idx + 2
+            ts    = datetime.now(ZoneInfo("Asia/Jakarta")).strftime("%Y-%m-%d %H:%M:%S")
+            label = f"[BOOSTED] {ts}" if is_boosted else f"[ORGANIC] {ts}"
 
-                # Masukkan ke dalam antrean batch update Google Sheets
-                if col_imp is not None:
-                    bulk_updates.append({"range": f"'{req.sheet_name}'!{col_letter(col_imp)}{gs_row}", "values": [[_safe_int_val(total_views)]]})
-                bulk_updates.append({"range": f"'{req.sheet_name}'!{col_letter(col_imp_ori)}{gs_row}", "values": [[_safe_int_val(views_organik)]]})
-                bulk_updates.append({"range": f"'{req.sheet_name}'!{col_letter(col_status_idx)}{gs_row}", "values": [[label]]})
+            # Menembak koordinat penulisan Google Sheet secara presisi menggunakan gs_row bawaan
+            if col_imp is not None:
+                bulk_updates.append({
+                    "range":  f"'{req.sheet_name}'!{col_letter(col_imp)}{gs_row}",
+                    "values": [[_safe_int_val(total_views)]],
+                })
+            bulk_updates.append({
+                "range":  f"'{req.sheet_name}'!{col_letter(col_imp_ori)}{gs_row}",
+                "values": [[_safe_int_val(views_organik)]],
+            })
+            bulk_updates.append({
+                "range":  f"'{req.sheet_name}'!{col_letter(col_status_idx)}{gs_row}",
+                "values": [[label]],
+            })
 
-                log(f" ✓ [{processed_count}/{limit}] Baris {gs_row} berhasil dibaca → {label}")
+            processed_count += 1
+            job_status["processed"] = processed_count
+            job_status["progress"]  = round(processed_count / limit * 100)
+            log(f"  ✓ [{processed_count}/{limit}] baris {gs_row} | streak={consecutive_success} | jeda={delay:.1f}s → {label}")
 
-                # Tulis data ke Google Sheets per 10 baris agar menghemat Kuota API Google
-                if len(bulk_updates) >= 30:
-                    update_sheet_values(service, req.spreadsheet_id, bulk_updates)
-                    bulk_updates = []
+            # ── Checkpoint write ──
+            if processed_count % CHECKPOINT_EVERY == 0 and bulk_updates:
+                log(f"[CHECKPOINT] Menyimpan {len(bulk_updates)} cells...")
+                update_sheet_values(service, req.spreadsheet_id, bulk_updates)
+                bulk_updates = []
 
-        # Tulis sisa data yang belum ter-update
+            # Coffee break anti-ban otomatis
+            if processed_count % random.randint(8, 14) == 0 and processed_count < limit:
+                pause = random.uniform(15, 30) if limit <= 30 else random.uniform(25, 45)
+                log(f"☕ [ANTI-BAN] Istirahat {pause:.1f}s...")
+                time.sleep(pause)
+
+        # ── Simpan sisa data yang belum ter-checkpoint ──
         if bulk_updates:
-            log(f"[WRITE] Menyimpan data terakhir ke Google Sheets...")
+            log(f"[WRITE] Menyimpan {len(bulk_updates)} cells tersisa...")
             update_sheet_values(service, req.spreadsheet_id, bulk_updates)
-
-        log(f"[JOB] Sukses memproses batch ini. Last run: {job_status['last_run']}")
+            log("[WRITE] Selesai.")
 
     except Exception as e:
         job_status["error"] = str(e)
-        log(f"[ERROR] Terjadi kegagalan sistem: {e}")
+        log(f"[ERROR] {e}")
     finally:
         job_status["running"]  = False
-        job_status["last_run"] = _wib_now_str()
+        job_status["last_run"] = datetime.now(ZoneInfo("Asia/Jakarta")).strftime("%Y-%m-%d %H:%M:%S")
 
 
 def trigger_automatic_job():

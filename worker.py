@@ -11,6 +11,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from typing import Optional
 from apscheduler.schedulers.background import BackgroundScheduler
+from apscheduler.triggers.cron import CronTrigger
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 
@@ -69,7 +70,7 @@ job_lock = threading.Lock()
 class SpreadsheetRequest(BaseModel):
     spreadsheet_id:     str
     sheet_name:         str
-    batch_size:         Optional[int] = 100
+    batch_size:         Optional[int] = 125  # 4 run/hari × 125 = 500 URL/24 jam
     google_credentials: Optional[dict] = None
 
 
@@ -101,7 +102,7 @@ def _safe_int_val(val) -> int:
 
 
 def _wib_now() -> datetime:
-    """Kembalikan datetime sekarang dalam WIB sebagai naive (tanpa tzinfo) untuk perbandingan konsisten."""
+    """Datetime WIB sebagai naive untuk perbandingan konsisten."""
     return datetime.now(ZoneInfo("Asia/Jakarta")).replace(tzinfo=None)
 
 
@@ -215,8 +216,7 @@ def fetch_fresh_post(shortcode: str, loader: instaloader.Instaloader):
 
     for url in endpoints:
         try:
-            # ✅ OPTIMASI: timeout asimetris (connect, read)
-            resp = session.get(url, timeout=(5, 10))
+            resp = session.get(url, timeout=(8, 12))
             if resp.status_code == 200:
                 items = resp.json().get("items", [])
                 if items:
@@ -308,7 +308,7 @@ def fetch_single_sequential(url: str, loader: instaloader.Instaloader) -> tuple:
             total_views, views_organik, is_boosted = get_views_from_post(post)
             if total_views > 0:
                 _failed_shortcodes.pop(shortcode, None)
-                _consecutive_conn_errors = 0  # reset karena berhasil
+                _consecutive_conn_errors = 0
                 return total_views, views_organik, "ok", is_boosted
 
             if attempt == 0:
@@ -319,25 +319,24 @@ def fetch_single_sequential(url: str, loader: instaloader.Instaloader) -> tuple:
         except Exception as e:
             err_name = type(e).__name__
 
-            # ✅ PERBAIKAN: tangani ConnectionException secara khusus
             if "ConnectionException" in err_name or "ConnectionError" in err_name:
                 _consecutive_conn_errors += 1
                 print(f"  [CONN-ERR] {shortcode} attempt {attempt+1}: {err_name} "
                       f"(beruntun ke-{_consecutive_conn_errors})")
 
                 if attempt == 0:
-                    # Jeda lebih panjang khusus ConnectionError
                     wait = random.uniform(20, 35)
                     print(f"  [CONN-ERR] Mundur {wait:.0f}s sebelum retry...")
                     time.sleep(wait)
 
-                # Jika ConnectionError sudah 3x beruntun lintas URL → reset loader
+                # 3x ConnectionError beruntun → reset loader
                 if _consecutive_conn_errors >= 3:
                     extra_wait = random.uniform(45, 75)
                     print(f"  [CONN-RESET] {_consecutive_conn_errors}x beruntun! "
                           f"Jeda {extra_wait:.0f}s lalu reset loader...")
                     time.sleep(extra_wait)
                     reset_loader()
+                    loader = get_loader()  # ambil loader baru setelah reset
                     _consecutive_conn_errors = 0
             else:
                 print(f"  ✗ {shortcode} attempt {attempt + 1}: {err_name}")
@@ -379,6 +378,9 @@ def update_sheet_values(service, spreadsheet_id: str, data_updates: list):
 # ─── CORE JOB ────────────────────────────────────────────────
 
 def run_job(req: SpreadsheetRequest):
+    # Catat waktu mulai untuk log durasi
+    job_start = _wib_now()
+
     with job_lock:
         if job_status["running"]:
             log("[JOB] Dilewati: job sebelumnya masih berjalan.")
@@ -392,7 +394,7 @@ def run_job(req: SpreadsheetRequest):
         service = get_sheets_service(req.google_credentials)
         loader  = get_loader()
 
-        # ✅ OPTIMASI SHEETS STEP 1: Baca header dulu (baris 1 saja)
+        # STEP 1: Baca header saja dulu (baris 1)
         header_raw = get_sheet_values(service, req.spreadsheet_id, f"'{req.sheet_name}'!1:1")
         if not header_raw:
             log("[JOB] Sheet kosong, skip.")
@@ -438,52 +440,49 @@ def run_job(req: SpreadsheetRequest):
         if updates_header:
             update_sheet_values(service, req.spreadsheet_id, updates_header)
 
-        # ✅ OPTIMASI SHEETS STEP 2: Baca hanya kolom yang relevan, bukan A:ZZ
-        # Kumpulkan indeks kolom yang dibutuhkan lalu buat range spesifik
+        # STEP 2: Baca hanya kolom relevan via batchGet
         needed_cols = sorted(set(filter(None.__ne__, [
             col_link, col_imp, col_imp_ori, col_status_idx, col_boost
         ])))
-        # Buat multi-range: misal "C2:C,F2:F,H2:H" agar tidak baca ratusan kolom kosong
-        col_ranges = ",".join(
+        col_ranges = [
             f"'{req.sheet_name}'!{col_letter(c)}2:{col_letter(c)}"
             for c in needed_cols
-        )
+        ]
         batch_result = service.spreadsheets().values().batchGet(
             spreadsheetId=req.spreadsheet_id,
-            ranges=col_ranges.split(","),
+            ranges=col_ranges,
         ).execute()
 
-        # Rekonstruksi data_rows dari hasil batchGet
-        # Setiap valueRange berisi data satu kolom secara vertikal
         value_ranges = batch_result.get("valueRanges", [])
         col_data: dict[int, list] = {}
         for vi, col_idx in enumerate(needed_cols):
             values = value_ranges[vi].get("values", []) if vi < len(value_ranges) else []
             col_data[col_idx] = [row[0] if row else "" for row in values]
 
-        # Tentukan jumlah baris data dari kolom link
-        total_rows = len(col_data.get(col_link, []))
+        # Normalisasi panjang kolom — acuan dari kolom link
+        link_col   = col_data.get(col_link, [])
+        status_col = col_data.get(col_status_idx, []) if col_status_idx is not None else []
+        boost_col  = col_data.get(col_boost, [])       if col_boost is not None else []
+        total_rows = len(link_col)
 
         # ── Filter baris yang perlu diproses ──
         now    = _wib_now()
         expiry = timedelta(hours=24)
 
-        # ✅ OPTIMASI: ekstrak boost_val langsung saat filter
-        # sehingga loop utama tidak perlu akses data_rows[idx] lagi
-        url_index_pairs: list[tuple[int, str, str]] = []  # (row_idx, url, boost_val)
+        url_index_pairs: list[tuple[int, str, str]] = []
+        debug_segar   = 0
+        debug_kosong  = 0
+        debug_expired = 0
 
         for i in range(total_rows):
-            cell_link = col_data.get(col_link, [""] * total_rows)
-            url_val   = cell_link[i] if i < len(cell_link) else ""
-
-            if "instagram.com" not in str(url_val):
+            url_val = str(link_col[i]).strip() if i < len(link_col) else ""
+            if "instagram.com" not in url_val:
                 continue
 
+            status_raw = str(status_col[i]).strip() if i < len(status_col) else ""
             need_process = True
 
-            if col_status_idx is not None:
-                status_col  = col_data.get(col_status_idx, [])
-                status_raw  = str(status_col[i]).strip() if i < len(status_col) else ""
+            if status_raw:
                 if "[ORGANIC]" in status_raw or "[BOOSTED]" in status_raw:
                     m = _TS_RE.search(status_raw)
                     if m:
@@ -491,24 +490,34 @@ def run_job(req: SpreadsheetRequest):
                             last_run = datetime.strptime(m.group(0), "%Y-%m-%d %H:%M:%S")
                             if now - last_run < expiry:
                                 need_process = False
+                                debug_segar += 1
+                            else:
+                                debug_expired += 1
                         except ValueError:
                             pass
+            else:
+                debug_kosong += 1
 
             if need_process:
-                boost_col = col_data.get(col_boost, []) if col_boost is not None else []
                 boost_val = str(boost_col[i]).strip().lower() if i < len(boost_col) else ""
-                url_index_pairs.append((i, url_val.strip(), boost_val))
+                url_index_pairs.append((i, url_val, boost_val))
 
         total_antrean = len(url_index_pairs)
         job_status["total"] = total_antrean
+
+        log(f"[FILTER] Total baris: {total_rows} | "
+            f"Kosong: {debug_kosong} | "
+            f"Kedaluwarsa: {debug_expired} | "
+            f"Segar (skip): {debug_segar} | "
+            f"Akan diproses: {total_antrean}")
 
         if not url_index_pairs:
             log("[JOB] Selesai. Semua data masih segar (<24 jam).")
             return
 
-        # ✅ OPTIMASI: filter URL tidak valid SEBELUM masuk loop utama
-        raw_pool = random.sample(url_index_pairs, min(req.batch_size or 50, total_antrean))
-        valid_pool = []
+        # Filter URL tidak valid sebelum masuk loop
+        raw_pool = random.sample(url_index_pairs, min(req.batch_size or 125, total_antrean))
+        valid_pool      = []
         skipped_invalid = 0
         for idx, url, boost_val in raw_pool:
             if extract_shortcode(url):
@@ -518,31 +527,32 @@ def run_job(req: SpreadsheetRequest):
                 log(f"  ⚠️ Skip URL tidak valid: {url}")
 
         if skipped_invalid:
-            log(f"[JOB] {skipped_invalid} URL dilewati (format tidak valid, tidak buang jeda).")
+            log(f"[JOB] {skipped_invalid} URL dilewati (format tidak valid).")
 
         limit = len(valid_pool)
         if not valid_pool:
             log("[JOB] Tidak ada URL valid untuk diproses.")
             return
 
-        log(f"[JOB] {total_antrean} kedaluwarsa. Memproses {limit} URL valid batch ini.")
+        log(f"[JOB] Memproses {limit} URL valid batch ini.")
 
         bulk_updates        = []
         processed_count     = 0
-        consecutive_success = 0  # tracker untuk jeda adaptif
+        success_count       = 0   # hanya URL yang benar-benar berhasil
+        consecutive_success = 0
         CHECKPOINT_EVERY    = 15
 
-        # ── Loop utama — satu loop bersih tanpa nested ──
+        # ── Loop utama ──
         for idx, url, boost_val in valid_pool:
             if not job_status["running"]:
                 log("[JOB] Dihentikan paksa.")
                 break
 
-            # ✅ OPTIMASI: jeda adaptif berdasarkan streak sukses
+            # Jeda adaptif berdasarkan streak sukses
             if consecutive_success >= 3:
-                delay = random.uniform(5.0, 9.0)    # lebih cepat saat track record bagus
+                delay = random.uniform(5.0, 9.0)
             else:
-                delay = random.uniform(10.0, 16.0)  # konservatif saat awal/setelah gagal
+                delay = random.uniform(10.0, 16.0)
             time.sleep(delay)
 
             total_views, views_organik, status, is_boosted_api = fetch_single_sequential(url, loader)
@@ -550,21 +560,21 @@ def run_job(req: SpreadsheetRequest):
             if status == "stopped":
                 break
 
-            # Update streak
             if status == "ok":
                 consecutive_success += 1
             else:
                 consecutive_success = 0
 
-            if status not in ("ok",) or total_views == 0:
-                log(f"  ✗ [{processed_count+1}/{limit}] baris {idx+2} GAGAL ({status}), "
-                    f"dilewati — akan dicoba ulang run berikutnya.")
+            # Gagal atau views=0 → jangan tulis, biarkan kosong untuk retry
+            if status != "ok" or total_views == 0:
+                log(f"  ✗ [{processed_count+1}/{limit}] baris {idx+2} "
+                    f"GAGAL ({status}) → dicoba ulang run berikutnya.")
                 processed_count += 1
                 job_status["processed"] = processed_count
                 job_status["progress"]  = round(processed_count / limit * 100)
-                continue  # ← langsung ke URL berikutnya, tidak tulis apapun
+                continue
 
-            # ✅ OPTIMASI: boost_val sudah diekstrak saat filter, tidak perlu akses data_rows lagi
+            # Override boost dari kolom manual
             is_boosted = is_boosted_api
             if boost_val in {"yes", "y", "true", "boosting", "1"}:
                 is_boosted    = True
@@ -572,7 +582,7 @@ def run_job(req: SpreadsheetRequest):
 
             ts     = _wib_now_str()
             label  = f"[BOOSTED] {ts}" if is_boosted else f"[ORGANIC] {ts}"
-            gs_row = idx + 2 
+            gs_row = idx + 2
 
             if col_imp is not None:
                 bulk_updates.append({
@@ -589,26 +599,30 @@ def run_job(req: SpreadsheetRequest):
             })
 
             processed_count += 1
+            success_count   += 1
             job_status["processed"] = processed_count
             job_status["progress"]  = round(processed_count / limit * 100)
-            log(
-                f"  ✓ [{processed_count}/{limit}] baris {gs_row} | "
-                f"streak={consecutive_success} | jeda={delay:.1f}s → {label}"
-            )
+            log(f"  ✓ [{processed_count}/{limit}] baris {gs_row} | "
+                f"streak={consecutive_success} | jeda={delay:.1f}s → {label}")
 
-            # ── Checkpoint write ──
+            # Checkpoint write setiap 15 item
             if processed_count % CHECKPOINT_EVERY == 0 and bulk_updates:
                 log(f"[CHECKPOINT] Menyimpan {len(bulk_updates)} cells...")
                 update_sheet_values(service, req.spreadsheet_id, bulk_updates)
                 bulk_updates = []
 
-            # Coffee break — durasi menyesuaikan ukuran batch
-            if processed_count % random.randint(8, 14) == 0 and processed_count < limit:
-                pause = random.uniform(15, 30) if limit <= 30 else random.uniform(25, 45)
+            # Coffee break — frekuensi & durasi menyesuaikan ukuran batch
+            if processed_count % random.randint(10, 15) == 0 and processed_count < limit:
+                if limit <= 75:
+                    pause = random.uniform(15, 25)
+                elif limit <= 125:
+                    pause = random.uniform(20, 35)
+                else:
+                    pause = random.uniform(30, 50)
                 log(f"☕ [ANTI-BAN] Istirahat {pause:.1f}s...")
                 time.sleep(pause)
 
-        # ── Simpan sisa yang belum di-checkpoint ──
+        # Simpan sisa yang belum di-checkpoint
         if bulk_updates:
             log(f"[WRITE] Menyimpan {len(bulk_updates)} cells tersisa...")
             update_sheet_values(service, req.spreadsheet_id, bulk_updates)
@@ -618,6 +632,13 @@ def run_job(req: SpreadsheetRequest):
         job_status["error"] = str(e)
         log(f"[ERROR] {e}")
     finally:
+        # Log ringkasan durasi run
+        durasi = (_wib_now() - job_start).seconds
+        menit  = durasi // 60
+        detik  = durasi % 60
+        log(f"[SELESAI] Durasi: {menit}m {detik}s | "
+            f"Diproses: {job_status['processed']} | "
+            f"Total antrean: {job_status['total']}")
         job_status["running"]  = False
         job_status["last_run"] = _wib_now_str()
 
@@ -763,8 +784,22 @@ def _ensure_scheduler():
     if not scheduler.get_job("automatic_ig_job"):
         if not scheduler.running:
             scheduler.start()
-        scheduler.add_job(trigger_automatic_job, "interval", hours=24, id="automatic_ig_job")
-        print("🔥 [SCHEDULER] Aktif, berjalan per 24 jam.")
+
+        # 4x sehari: 07.00, 13.00, 17.00, 22.00 WIB
+        # Hindari jam 00.00–06.00 karena IG lebih sensitif di jam sepi
+        scheduler.add_job(
+            trigger_automatic_job,
+            CronTrigger(
+                hour="7,13,17,22",
+                minute="0",
+                timezone=ZoneInfo("Asia/Jakarta"),
+            ),
+            id="automatic_ig_job",
+        )
+        print("🔥 [SCHEDULER] Aktif — berjalan 4x sehari: 07.00 | 13.00 | 17.00 | 22.00 WIB")
+        print(f"   Run berikutnya akan memproses hingga {125} URL per sesi.")
+    else:
+        print("ℹ️ [SCHEDULER] Sudah aktif.")
 
 
 # ─── LIFECYCLE ───────────────────────────────────────────────

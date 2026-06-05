@@ -30,7 +30,7 @@ app.add_middleware(
 )
 
 # ─── CONSTANTS ───────────────────────────────────────────────
-IG_USERNAME       = "cat_streat"
+IG_USERNAME       = "Ace.Shuttle"
 HF_REPO_ID        = "adityaUHU/job-driver"
 IMPORTANT_COOKIES = ["sessionid", "csrftoken", "ds_user_id", "ig_did", "mid"]
 

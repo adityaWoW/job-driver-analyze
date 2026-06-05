@@ -22,7 +22,7 @@ scheduler       = BackgroundScheduler()
 current_job_req = None
 
 # ─── CONSTANTS ───────────────────────────────────────────────
-IG_USERNAME       = "Ace.Shuttle"
+IG_USERNAME       = "cat_streat"
 HF_REPO_ID        = "adityaUHU/job-driver"
 IMPORTANT_COOKIES = ["sessionid", "csrftoken", "ds_user_id", "ig_did", "mid"]
 

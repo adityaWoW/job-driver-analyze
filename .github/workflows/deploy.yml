@@ -8,15 +8,23 @@ on:
 jobs:
   deploy:
     runs-on: ubuntu-latest
+
     steps:
       - name: Checkout kode
         uses: actions/checkout@v3
         with:
           fetch-depth: 0
 
-      - name: Push ke Hugging Face
+      - name: Push ke Hugging Face Space 1
         env:
           HF_TOKEN: ${{ secrets.HF_TOKEN }}
         run: |
-          git remote add huggingface https://adityaUHU:$HF_TOKEN@huggingface.co/spaces/adityaUHU/job-driver
-          git push huggingface main --force
+          git remote add hf1 https://adityaUHU:$HF_TOKEN@huggingface.co/spaces/adityaUHU/job-driver
+          git push hf1 main --force
+
+      - name: Push ke Hugging Face Space 2
+        env:
+          HF_TOKEN2: ${{ secrets.HF_TOKEN2 }}
+        run: |
+          git remote add hf2 https://adityaUHU:$HF_TOKEN2@huggingface.co/spaces/adityaUHU/job-driver2
+          git push hf2 main --force

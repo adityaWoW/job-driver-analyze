@@ -20,7 +20,6 @@ from googleapiclient.discovery import build
 
 scheduler = BackgroundScheduler()
 current_job_req = None
-_consecutive_conn_errors = 0
 
 app = FastAPI(title="IG View Worker")
 app.add_middleware(
@@ -31,7 +30,7 @@ app.add_middleware(
 )
 
 # ─── CONSTANTS ───────────────────────────────────────────────
-IG_USERNAME       = "Ace.Shuttle"
+IG_USERNAME       = "cat_streat"
 HF_REPO_ID        = "adityaUHU/job-driver"
 IMPORTANT_COOKIES = ["sessionid", "csrftoken", "ds_user_id", "ig_did", "mid"]
 
@@ -281,7 +280,8 @@ def fetch_fresh_post(shortcode: str, loader: instaloader.Instaloader):
                 break
 
             if resp.status_code in (404, 410):
-                return None, "not_found"
+                # return None, "not_found"
+                continue
 
             continue
 
@@ -294,18 +294,19 @@ def fetch_fresh_post(shortcode: str, loader: instaloader.Instaloader):
     # ── Layer 2: Fallback Instaloader Native (Kunci Akurasi Kode Lama Anda) ──
     if not got_rate_limit:
         try:
-            # Menggunakan core instaloader yang stabil dalam menerjemahkan struktur HTML/JSON baru Instagram
             post = instaloader.Post.from_shortcode(loader.context, shortcode)
-            
-            # Tambahkan perlindungan ekstra: pastikan objek post valid
             if post and (getattr(post, "shortcode", "") == shortcode):
                 return post, "ok"
-        except Exception as e:
-            name = type(e).__name__
-            if "TooManyRequests" in name or "429" in str(e):
+        except instaloader.exceptions.PostChangedException:
+            return None, "not_found"
+        except instaloader.exceptions.ConnectionException as e:
+            if "404" in str(e):
+                # Jika Instaloader Native juga bilang 404, baru ini FIX dihapus/not_found
+                return None, "not_found"
+            if "TooManyRequests" in type(e).__name__ or "429" in str(e):
                 return None, "rate_limit"
-            if any(k in name for k in ("ConnectionException", "ConnectionError")):
-                return None, "conn_error"
+            return None, "conn_error"
+        except Exception as e:
             return None, "error"
 
     return None, "rate_limit"

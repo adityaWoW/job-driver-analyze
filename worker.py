@@ -5,7 +5,6 @@ import random
 import threading
 import instaloader
 import re
-from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, HTTPException, BackgroundTasks
 from fastapi.middleware.cors import CORSMiddleware
@@ -14,36 +13,28 @@ from typing import Optional
 from apscheduler.schedulers.background import BackgroundScheduler
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 from google.oauth2 import service_account
 from googleapiclient.discovery import build
 
-scheduler       = BackgroundScheduler()
+scheduler = BackgroundScheduler()
 current_job_req = None
+_consecutive_conn_errors = 0
+
+app = FastAPI(title="IG View Worker")
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["https://analisis-data-instagram-fe.vercel.app"],
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
 # ─── CONSTANTS ───────────────────────────────────────────────
-IG_USERNAME       = "cat_streat"
+IG_USERNAME       = "Ace.Shuttle"
 HF_REPO_ID        = "adityaUHU/job-driver"
 IMPORTANT_COOKIES = ["sessionid", "csrftoken", "ds_user_id", "ig_did", "mid"]
-
-MAX_FAIL_COUNT    = 3    # sama seperti code lama yg stabil
-MAX_RETRY_ROUNDS  = 2    # putaran retry setelah pass utama selesai
-RETRY_BATCH_LIMIT = 50   # maks URL per putaran retry
-
-# Jeda antar-request normal (sama seperti code lama)
-DELAY_FAST_MIN  = 5.0
-DELAY_FAST_MAX  = 9.0
-DELAY_SLOW_MIN  = 10.0
-DELAY_SLOW_MAX  = 16.0
-
-# Jeda saat rate-limit — lebih konservatif dari sebelumnya
-RATE_LIMIT_WAIT_MIN   = 45
-RATE_LIMIT_WAIT_MAX   = 75
-RATE_LIMIT_EXTRA_WAIT = 60   # setelah reset loader
-
-# Berapa kali rate-limit berturut sebelum reset loader
-RATE_LIMIT_RESET_AT = 4      # lebih toleran (sebelumnya 3)
-CONN_ERROR_RESET_AT = 3
+MAX_FAIL_COUNT    = 3
 
 USER_AGENTS = [
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
@@ -68,14 +59,9 @@ _loader_lock = threading.Lock()
 
 _failed_shortcodes: dict[str, int] = {}
 
-# Counter dipisah — rate_limit dan conn_error tidak saling mempengaruhi
-_consec_rate_limits = 0
-_consec_conn_errors  = 0
-
 job_status = {
     "running": False, "progress": 0, "total": 0,
     "processed": 0, "log": [], "last_run": None, "error": None,
-    "retry_round": 0, "retry_total": 0, "retry_processed": 0,
 }
 job_lock = threading.Lock()
 
@@ -83,7 +69,7 @@ job_lock = threading.Lock()
 class SpreadsheetRequest(BaseModel):
     spreadsheet_id:     str
     sheet_name:         str
-    batch_size:         Optional[int] = 300
+    batch_size:         Optional[int] = 300  # Ditingkatkan default ke 300
     google_credentials: Optional[dict] = None
 
 
@@ -92,8 +78,8 @@ class SpreadsheetRequest(BaseModel):
 def log(msg: str):
     print(msg)
     job_status["log"].append(msg)
-    if len(job_status["log"]) > 300:
-        job_status["log"] = job_status["log"][-300:]
+    if len(job_status["log"]) > 200:
+        job_status["log"] = job_status["log"][-200:]
 
 
 def col_letter(i: int) -> str:
@@ -127,8 +113,7 @@ def _wib_now_str() -> str:
 def load_instagram_cookies() -> dict:
     for source, getter in [
         ("env",  lambda: os.environ.get("INSTAGRAM_COOKIES")),
-        ("file", lambda: open("storage/cookies.json").read()
-                         if os.path.exists("storage/cookies.json") else None),
+        ("file", lambda: open("storage/cookies.json").read() if os.path.exists("storage/cookies.json") else None),
     ]:
         raw = getter()
         if not raw:
@@ -141,6 +126,7 @@ def load_instagram_cookies() -> dict:
                 return cookie_map
         except Exception as e:
             print(f"⚠️ Gagal parse cookies dari {source}: {e}")
+
     print("❌ Tidak ada cookies tersedia!")
     return {}
 
@@ -190,18 +176,15 @@ def get_loader() -> instaloader.Instaloader:
             compress_json=False,
         )
         L.context.max_connection_attempts = 1
-        L.context._session.cookies.update(
-            {k: ig_cookies.get(k, "") for k in IMPORTANT_COOKIES}
-        )
-        L.context._session.headers.update(
-            _build_random_headers(ig_cookies.get("csrftoken", ""))
-        )
+        L.context._session.cookies.update({k: ig_cookies.get(k, "") for k in IMPORTANT_COOKIES})
+        L.context._session.headers.update(_build_random_headers(ig_cookies.get("csrftoken", "")))
         L.context.username = IG_USERNAME
+
         _loader_instance = L
         return L
 
 
-# ─── INSTAGRAM FETCH ─────────────────────────────────────────
+# ─── INSTAGRAM FETCH HELPERS ─────────────────────────────────
 
 _SHORTCODE_RE = re.compile(r"/(?:p|reel|reels|tv)/([A-Za-z0-9_-]+)")
 _TS_RE        = re.compile(r"\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}")
@@ -213,13 +196,6 @@ def extract_shortcode(url: str) -> Optional[str]:
 
 
 def fetch_fresh_post(shortcode: str, loader: instaloader.Instaloader):
-    """
-    Ambil post dari Instagram. Mengembalikan (post_obj, status_str).
-    Perilaku persis seperti code lama yang stabil: tidak langsung raise,
-    cukup return status sehingga caller yang memutuskan cara menanganinya.
-
-    Status: "ok" | "rate_limit" | "not_found" | "conn_error" | "error" | "empty"
-    """
     session = loader.context._session
     session.headers.update({
         "user-agent":      random.choice(USER_AGENTS),
@@ -233,17 +209,11 @@ def fetch_fresh_post(shortcode: str, loader: instaloader.Instaloader):
     ]
     random.shuffle(endpoints)
 
-    got_rate_limit = False
-
     for url in endpoints:
         try:
             resp = session.get(url, timeout=(5, 10))
-
             if resp.status_code == 200:
-                try:
-                    items = resp.json().get("items", [])
-                except ValueError:
-                    continue
+                items = resp.json().get("items", [])
                 if items:
                     item = items[0]
                     class MockPost:
@@ -251,64 +221,32 @@ def fetch_fresh_post(shortcode: str, loader: instaloader.Instaloader):
                         _full_metadata = item
                         likes          = item.get("like_count", 0)
                         comments       = item.get("comment_count", 0)
-                    return MockPost(), "ok"
-                # 200 tapi kosong — coba endpoint berikutnya
-                continue
-
+                    return MockPost()
             if resp.status_code == 429:
-                # Tandai tapi jangan langsung return — biar fallback instaloader dicoba
-                got_rate_limit = True
-                break   # tidak perlu coba endpoint lain, IP sudah kena throttle
-
-            if resp.status_code in (401, 403):
-                got_rate_limit = True
                 break
+        except Exception:
+            pass
 
-            if resp.status_code in (404, 410):
-                return None, "not_found"
+    try:
+        return instaloader.Post.from_shortcode(loader.context, shortcode)
+    except Exception:
+        pass
 
-            # 500/502/503 → coba endpoint berikutnya
-            continue
-
-        except Exception as e:
-            name = type(e).__name__
-            if any(k in name for k in ("ConnectionError", "ConnectTimeout", "ReadTimeout")):
-                return None, "conn_error"
-            # Exception lain (decode error, dll.) → coba endpoint berikutnya
-            continue
-
-    # ── Fallback ke instaloader native ──
-    # Ini yang membuat code lama stabil: selalu dicoba walau endpoint JSON gagal
-    if not got_rate_limit:
-        try:
-            post = instaloader.Post.from_shortcode(loader.context, shortcode)
-            return post, "ok"
-        except Exception as e:
-            name = type(e).__name__
-            if "TooManyRequests" in name or "429" in str(e):
-                return None, "rate_limit"
-            if any(k in name for k in ("ConnectionException", "ConnectionError")):
-                return None, "conn_error"
-            # Error lain (private, deleted, dll.)
-            return None, "error"
-
-    return None, "rate_limit"
+    class EmptyPost:
+        is_video       = True
+        _full_metadata = {}
+        likes          = 0
+        comments       = 0
+    return EmptyPost()
 
 
 def get_views_from_post(post) -> tuple[int, int, bool]:
     raw = getattr(post, "_full_metadata", {}) or {}
-
-    # ── Foto / Non-video ────────────────────────────────────
+    
     if not raw.get("is_video", True) and raw.get("__typename") != "GraphVideo":
-        likes_count = (
-            raw.get("edge_media_preview_like", {}).get("count", 0)
-            or raw.get("like_count", 0)
-            or getattr(post, "likes", 0)
-            or 0
-        )
+        likes_count = raw.get("edge_media_preview_like", {}).get("count", 0) or getattr(post, "likes", 0) or 0
         return likes_count, likes_count, False
 
-    # ── Video / Reel ─────────────────────────────────────────
     total_views = 0
     for key in ("video_play_count", "play_count", "ig_play_count"):
         val = raw.get(key)
@@ -316,19 +254,15 @@ def get_views_from_post(post) -> tuple[int, int, bool]:
             total_views = int(val)
             break
     if total_views == 0:
-        val = raw.get("edge_media_to_media_video_view", {})
-        if isinstance(val, dict):
-            total_views = val.get("count", 0)
-
+        total_views = raw.get("edge_media_to_media_video_view", {}).get("count", 0)
     if total_views == 0:
         return 0, 0, False
 
-    views_organik = raw.get("video_view_count", 0) or 0
+    views_organik = raw.get("video_view_count", 0)
     is_boosted    = any(raw.get(f) is True for f in BOOST_FLAGS)
 
     if is_boosted:
-        if not (0 < views_organik < total_views):
-            views_organik = int(total_views * 0.40)
+        views_organik = int(total_views * 0.40) if not (0 < views_organik < total_views) else views_organik
     else:
         views_organik = total_views
 
@@ -336,106 +270,46 @@ def get_views_from_post(post) -> tuple[int, int, bool]:
     return total_views, views_organik, is_boosted
 
 
-def fetch_single(
-    url: str,
-    loader: instaloader.Instaloader,
-    is_retry: bool = False,
-) -> tuple[int, int, str, bool]:
-    """
-    Ambil views untuk satu URL. Perilaku mirip code lama:
-    - 2 attempt (3 saat retry)
-    - Kalau rate_limit → tunggu lama, lanjut attempt berikut
-    - Kalau conn_error → tunggu sebentar, lanjut attempt berikut
-    - Reset loader hanya bila error berturut melewati threshold
-    - TIDAK menulis 0 ke sheet — caller wajib cek status sebelum menulis
-
-    Return: (total_views, views_organik, status, is_boosted)
-    """
-    global _consec_rate_limits, _consec_conn_errors
+def fetch_single_sequential(url: str, loader: instaloader.Instaloader) -> tuple:
+    global _consecutive_conn_errors
 
     shortcode = extract_shortcode(url)
     if not shortcode:
         return 0, 0, "invalid_url", False
 
-    if _failed_shortcodes.get(shortcode, 0) >= MAX_FAIL_COUNT:
+    fail_count = _failed_shortcodes.get(shortcode, 0)
+    if fail_count >= MAX_FAIL_COUNT:
         return 0, 0, "skipped", False
 
-    attempts   = 3 if is_retry else 2
-    loader_ref = [loader]
-
-    for attempt in range(attempts):
+    for attempt in range(2):
         if not job_status["running"]:
             return 0, 0, "stopped", False
+        try:
+            post = fetch_fresh_post(shortcode, loader)
+            total_views, views_organik, is_boosted = get_views_from_post(post)
+            if total_views > 0:
+                _failed_shortcodes.pop(shortcode, None)
+                _consecutive_conn_errors = 0
+                return total_views, views_organik, "ok", is_boosted
 
-        post, status = fetch_fresh_post(shortcode, loader_ref[0])
-
-        # ── not_found: hentikan, tidak perlu retry ───────────
-        if status == "not_found":
-            _consec_rate_limits = 0
-            _consec_conn_errors  = 0
-            return 0, 0, "not_found", False
-
-        # ── rate_limit ───────────────────────────────────────
-        if status == "rate_limit":
-            _consec_rate_limits += 1
-            _consec_conn_errors  = 0
-            wait = random.uniform(RATE_LIMIT_WAIT_MIN, RATE_LIMIT_WAIT_MAX)
-            log(
-                f"  ⏳ rate_limit [{shortcode}] attempt {attempt+1}/{attempts} "
-                f"— tunggu {wait:.0f}s (berturut: {_consec_rate_limits})"
-            )
-            time.sleep(wait)
-
-            if _consec_rate_limits >= RATE_LIMIT_RESET_AT:
-                log(f"  🔄 {_consec_rate_limits}× rate_limit — reset loader + jeda {RATE_LIMIT_EXTRA_WAIT}s...")
-                reset_loader()
-                time.sleep(RATE_LIMIT_EXTRA_WAIT)
-                loader_ref[0]       = get_loader()
-                _consec_rate_limits = 0
-            continue
-
-        # ── conn_error ───────────────────────────────────────
-        if status == "conn_error":
-            _consec_conn_errors  += 1
-            _consec_rate_limits   = 0
-            wait = random.uniform(10, 20)
-            log(
-                f"  ⏳ conn_error [{shortcode}] attempt {attempt+1}/{attempts} "
-                f"— tunggu {wait:.0f}s (berturut: {_consec_conn_errors})"
-            )
-            time.sleep(wait)
-
-            if _consec_conn_errors >= CONN_ERROR_RESET_AT:
-                log(f"  🔄 {_consec_conn_errors}× conn_error — reset loader + jeda 30s...")
-                reset_loader()
-                time.sleep(30)
-                loader_ref[0]      = get_loader()
-                _consec_conn_errors = 0
-            continue
-
-        # ── error generik (private post, deleted, dll.) ──────
-        if status == "error" or post is None:
-            if attempt < attempts - 1:
+            if attempt == 0:
                 time.sleep(random.uniform(3.0, 6.0))
-            continue
 
-        # ── Post berhasil diambil — parse views ──────────────
-        _consec_rate_limits = 0
-        _consec_conn_errors  = 0
+        except Exception as e:
+            err_name = type(e).__name__
+            if "ConnectionException" in err_name or "ConnectionError" in err_name:
+                _consecutive_conn_errors += 1
+                if attempt == 0:
+                    time.sleep(random.uniform(10, 20))
 
-        total_views, views_organik, is_boosted = get_views_from_post(post)
+                if _consecutive_conn_errors >= 3:
+                    time.sleep(30)
+                    reset_loader()
+                    _consecutive_conn_errors = 0
+            else:
+                if attempt == 0:
+                    time.sleep(5)
 
-        if total_views > 0:
-            _failed_shortcodes.pop(shortcode, None)
-            return total_views, views_organik, "ok", is_boosted
-
-        # Views = 0 (post ada tapi data belum muncul) — coba lagi
-        if attempt < attempts - 1:
-            wait = random.uniform(5.0, 8.0)
-            log(f"  🔁 views=0 [{shortcode}] — coba ulang dalam {wait:.1f}s...")
-            time.sleep(wait)
-
-    # Semua attempt habis
     _failed_shortcodes[shortcode] = _failed_shortcodes.get(shortcode, 0) + 1
     return 0, 0, "error", False
 
@@ -444,20 +318,13 @@ def fetch_single(
 
 def get_sheets_service(creds_override: dict = None):
     creds_json = creds_override or json.loads(os.environ.get("GOOGLE_CREDENTIALS", "{}"))
-    scopes = [
-        "https://www.googleapis.com/auth/spreadsheets",
-        "https://www.googleapis.com/auth/drive",
-    ]
+    scopes = ["https://www.googleapis.com/auth/spreadsheets", "https://www.googleapis.com/auth/drive"]
     creds = service_account.Credentials.from_service_account_info(creds_json, scopes=scopes)
     return build("sheets", "v4", credentials=creds)
 
 
 def get_sheet_values(service, spreadsheet_id: str, range_name: str):
-    result = (
-        service.spreadsheets().values()
-        .get(spreadsheetId=spreadsheet_id, range=range_name)
-        .execute()
-    )
+    result = service.spreadsheets().values().get(spreadsheetId=spreadsheet_id, range=range_name).execute()
     return result.get("values", [])
 
 
@@ -470,156 +337,9 @@ def update_sheet_values(service, spreadsheet_id: str, data_updates: list):
     ).execute()
 
 
-def _build_row_updates(
-    sheet_name: str,
-    gs_row: int,
-    total_views: int,
-    views_organik: int,
-    is_boosted: bool,
-    col_imp: Optional[int],
-    col_imp_ori: int,
-    col_status_idx: int,
-) -> list[dict]:
-    ts    = _wib_now_str()
-    label = f"[BOOSTED] {ts}" if is_boosted else f"[ORGANIC] {ts}"
-    updates = []
-    if col_imp is not None:
-        updates.append({
-            "range":  f"'{sheet_name}'!{col_letter(col_imp)}{gs_row}",
-            "values": [[_safe_int_val(total_views)]],
-        })
-    updates.append({
-        "range":  f"'{sheet_name}'!{col_letter(col_imp_ori)}{gs_row}",
-        "values": [[_safe_int_val(views_organik)]],
-    })
-    updates.append({
-        "range":  f"'{sheet_name}'!{col_letter(col_status_idx)}{gs_row}",
-        "values": [[label]],
-    })
-    return updates
-
-
-# ─── RETRY ROUND ─────────────────────────────────────────────
-
-def run_retry_round(
-    round_num:      int,
-    retry_queue:    list,
-    data_rows:      list,
-    service,
-    req:            SpreadsheetRequest,
-    col_imp:        Optional[int],
-    col_imp_ori:    int,
-    col_status_idx: int,
-    col_boost:      Optional[int],
-) -> list:
-    """
-    Jalankan satu putaran retry untuk URL yang sebelumnya gagal / views=0.
-    Mengembalikan list yang masih gagal.
-    """
-    if not retry_queue:
-        return []
-
-    batch     = retry_queue[:RETRY_BATCH_LIMIT]
-    remaining = retry_queue[RETRY_BATCH_LIMIT:]
-    total     = len(batch)
-
-    job_status["retry_round"]     = round_num
-    job_status["retry_total"]     = total
-    job_status["retry_processed"] = 0
-
-    log(f"\n{'='*55}")
-    log(f"🔁 RETRY ROUND {round_num} — {total} URL")
-    log(f"{'='*55}")
-
-    # Cooling down + sesi baru sebelum retry
-    log(f"⏳ Cooling down 45s sebelum retry round {round_num}...")
-    time.sleep(45)
-    reset_loader()
-    loader = get_loader()
-
-    bulk_updates  = []
-    still_failed  = []
-    consec_ok     = 0
-    CHECKPOINT_AT = 10
-
-    for order, (idx, gs_row, url) in enumerate(batch, start=1):
-        if not job_status["running"]:
-            log("[RETRY] Dihentikan paksa.")
-            still_failed.extend(batch[order - 1:])
-            break
-
-        # Jeda retry lebih sabar
-        delay = (
-            random.uniform(10.0, 16.0) if consec_ok >= 3
-            else random.uniform(20.0, 32.0)
-        )
-        time.sleep(delay)
-
-        total_views, views_organik, status, is_boosted_api = fetch_single(
-            url, loader, is_retry=True
-        )
-
-        if status == "stopped":
-            still_failed.extend(batch[order - 1:])
-            break
-
-        job_status["retry_processed"] = order
-
-        if status == "ok" and total_views > 0:
-            consec_ok += 1
-
-            is_boosted = is_boosted_api
-            if col_boost is not None and col_boost < len(data_rows[idx]):
-                val = str(data_rows[idx][col_boost]).strip().lower()
-                if val in {"yes", "y", "true", "boosting", "1"}:
-                    is_boosted    = True
-                    views_organik = int(total_views * 0.4) if total_views else 0
-
-            bulk_updates.extend(
-                _build_row_updates(
-                    req.sheet_name, gs_row,
-                    total_views, views_organik, is_boosted,
-                    col_imp, col_imp_ori, col_status_idx,
-                )
-            )
-            log(
-                f"  ✅ [R{round_num}] [{order}/{total}] baris {gs_row} "
-                f"→ views={total_views:,} | streak={consec_ok} | jeda={delay:.1f}s"
-            )
-        else:
-            consec_ok = 0
-            still_failed.append((idx, gs_row, url))
-            log(
-                f"  ❌ [R{round_num}] [{order}/{total}] baris {gs_row} "
-                f"→ {status} | jeda={delay:.1f}s"
-            )
-
-        if order % CHECKPOINT_AT == 0 and bulk_updates:
-            log(f"[R{round_num} CKPT] Menyimpan {len(bulk_updates)} cells...")
-            update_sheet_values(service, req.spreadsheet_id, bulk_updates)
-            bulk_updates = []
-
-        if order % random.randint(6, 10) == 0 and order < total:
-            pause = random.uniform(35, 55)
-            log(f"☕ [R{round_num}] Anti-ban {pause:.1f}s...")
-            time.sleep(pause)
-
-    if bulk_updates:
-        update_sheet_values(service, req.spreadsheet_id, bulk_updates)
-
-    all_failed = still_failed + remaining
-    log(
-        f"✔ R{round_num} selesai — "
-        f"OK: {total - len(still_failed)}/{total} | gagal: {len(all_failed)}"
-    )
-    return all_failed
-
-
 # ─── CORE JOB ────────────────────────────────────────────────
 
 def run_job(req: SpreadsheetRequest):
-    global _consec_rate_limits, _consec_conn_errors
-
     with job_lock:
         if job_status["running"]:
             log("[JOB] Dilewati: job sebelumnya masih berjalan.")
@@ -627,11 +347,7 @@ def run_job(req: SpreadsheetRequest):
         job_status.update({
             "running": True, "progress": 0, "total": 0,
             "processed": 0, "log": [], "error": None,
-            "retry_round": 0, "retry_total": 0, "retry_processed": 0,
         })
-
-    _consec_rate_limits = 0
-    _consec_conn_errors  = 0
 
     try:
         service = get_sheets_service(req.google_credentials)
@@ -645,15 +361,15 @@ def run_job(req: SpreadsheetRequest):
         header    = raw_rows[0]
         data_rows = raw_rows[1:]
 
-        # ── Deteksi kolom ────────────────────────────────────
-        col_map: dict[str, int] = {}
+        # ── Deteksi kolom (satu pass) ──
+        col_map = {}
         for i, c in enumerate(header):
             cl = c.lower()
-            if "link post" in cl:           col_map["link"]    = i
-            elif "total imp by job" in cl:  col_map["imp"]     = i
-            elif "total imp organik" in cl: col_map["imp_ori"] = i
-            elif "status(job)" in cl:       col_map["status"]  = i
-            elif "boost" in cl:             col_map["boost"]   = i
+            if "link post" in cl:            col_map["link"]    = i
+            elif "total imp by job" in cl:   col_map["imp"]     = i
+            elif "total imp organik" in cl:  col_map["imp_ori"] = i
+            elif "status(job)" in cl:        col_map["status"]  = i
+            elif "boost" in cl:              col_map["boost"]   = i
 
         if "link" not in col_map:
             log("[JOB] Kolom 'link post' tidak ditemukan!")
@@ -665,212 +381,178 @@ def run_job(req: SpreadsheetRequest):
         col_status_idx = col_map.get("status")
         col_boost      = col_map.get("boost")
 
-        # ── Buat kolom baru jika belum ada ───────────────────
+        # ── Tambah kolom baru jika perlu ──
         updates_header = []
         if col_imp_ori is None:
-            col_imp_ori = len(header); header.append("TOTAL IMP ORGANIK(VIEW COUNT)")
+            col_imp_ori = len(header)
+            header.append("TOTAL IMP ORGANIK(VIEW COUNT)")
             updates_header.append({
-                "range": f"'{req.sheet_name}'!{col_letter(col_imp_ori)}1",
+                "range":  f"'{req.sheet_name}'!{col_letter(col_imp_ori)}1",
                 "values": [["TOTAL IMP ORGANIK(VIEW COUNT)"]],
-            })
+            }
+        )
+
         if col_imp is None:
-            col_imp = len(header); header.append("TOTAL IMP BY JOB(PLAY COUNT)")
+            col_imp = len(header)
+            header.append("TOTAL IMP BY JOB(PLAY COUNT)")
             updates_header.append({
-                "range": f"'{req.sheet_name}'!{col_letter(col_imp)}1",
+                "range":  f"'{req.sheet_name}'!{col_letter(col_imp)}1",
                 "values": [["TOTAL IMP BY JOB(PLAY COUNT)"]],
-            })
+            }
+        )
+            
         if col_status_idx is None:
-            col_status_idx = len(header); header.append("STATUS(JOB)")
+            col_status_idx = len(header)
+            header.append("STATUS(JOB)")
             updates_header.append({
-                "range": f"'{req.sheet_name}'!{col_letter(col_status_idx)}1",
+                "range":  f"'{req.sheet_name}'!{col_letter(col_status_idx)}1",
                 "values": [["STATUS(JOB)"]],
             })
         if updates_header:
             update_sheet_values(service, req.spreadsheet_id, updates_header)
 
-        # ── Filter baris yang perlu diproses ─────────────────
-        now    = _wib_now()
+        # ── Filter baris yang perlu diproses ──
+        now    = datetime.now(ZoneInfo("Asia/Jakarta")).replace(tzinfo=None)
         expiry = timedelta(hours=24)
+        _ts_re = re.compile(r"\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}")
 
         url_index_pairs = []
         for i, row in enumerate(data_rows):
             if col_link >= len(row) or "instagram.com" not in str(row[col_link]):
                 continue
+
             need_process = True
             if col_status_idx is not None and col_status_idx < len(row):
-                s = str(row[col_status_idx]).strip()
-                if "[ORGANIC]" in s or "[BOOSTED]" in s:
-                    m = _TS_RE.search(s)
+                status_raw = str(row[col_status_idx]).strip()
+                if "[ORGANIC]" in status_raw or "[BOOSTED]" in status_raw:
+                    m = _ts_re.search(status_raw)
                     if m:
                         try:
-                            if now - datetime.strptime(m.group(0), "%Y-%m-%d %H:%M:%S") < expiry:
+                            last_run = datetime.strptime(m.group(0), "%Y-%m-%d %H:%M:%S")
+                            if now - last_run < expiry:
                                 need_process = False
                         except ValueError:
                             pass
+
             if need_process:
+                # KUNCI PERBAIKAN: Ikat indeks list (i) dan baris Google Sheets asli (i + 2) bersama URL
                 url_index_pairs.append((i, i + 2, row[col_link].strip()))
 
-        total_antrean       = len(url_index_pairs)
+        total_antrean = len(url_index_pairs)
         job_status["total"] = total_antrean
 
         if not url_index_pairs:
             log("[JOB] Selesai. Semua data masih segar (<24 jam).")
             return
 
-        # ── Sampel acak + validasi ────────────────────────────
-        sampled = random.sample(
-            url_index_pairs,
-            min(req.batch_size or 300, total_antrean),
-        )
+        # ── Filter URL tidak valid SEBELUM loop utama & Ambil Sampel Acak ──
         valid_pool = []
-        for idx, gs_line, url in sampled:
+        skipped = 0
+        
+        # Mengacak antrean secara aman dengan mempertahankan relasi indeks dan baris GS asli
+        sampled_pairs = random.sample(url_index_pairs, min(req.batch_size or 50, total_antrean))
+        
+        for idx, gs_line, url in sampled_pairs:
             if extract_shortcode(url):
                 valid_pool.append((idx, gs_line, url))
             else:
+                skipped += 1
                 log(f"  ⚠️ Skip URL tidak valid: {url}")
 
+        if skipped:
+            log(f"[JOB] {skipped} URL dilewati (format tidak valid).")
+
         limit = len(valid_pool)
-        if not limit:
-            log("[JOB] Tidak ada URL valid.")
+        if not valid_pool:
+            log("[JOB] Tidak ada URL valid untuk diproses.")
             return
 
-        log(f"[JOB] {total_antrean} kedaluwarsa — memproses {limit} URL batch ini.")
+        log(f"[JOB] {total_antrean} kedaluwarsa. Memproses {limit} URL valid batch ini.")
 
-        # ════════════════════════════════════════════════════
-        # PASS UTAMA
-        # Proses SEMUA url dulu, tampung yang gagal ke failed_queue
-        # ════════════════════════════════════════════════════
-        bulk_updates  = []
-        failed_queue  = []          # (idx, gs_row, url) — untuk retry
-        processed     = 0
-        consec_ok     = 0
-        CHECKPOINT_AT = 15
+        bulk_updates        = []
+        processed_count     = 0
+        consecutive_success = 0    # ← tracker untuk jeda adaptif
+        CHECKPOINT_EVERY    = 15
 
+        # ── Loop utama — Sinkronisasi Posisi Baris Terjamin ──
         for idx, gs_row, url in valid_pool:
             if not job_status["running"]:
                 log("[JOB] Dihentikan paksa.")
                 break
 
-            delay = (
-                random.uniform(DELAY_FAST_MIN, DELAY_FAST_MAX) if consec_ok >= 3
-                else random.uniform(DELAY_SLOW_MIN, DELAY_SLOW_MAX)
-            )
+            # Jeda adaptif anti-bot tetap dipertahankan
+            if consecutive_success >= 3:
+                delay = random.uniform(5.0, 9.0)
+            else:
+                delay = random.uniform(10.0, 16.0)
             time.sleep(delay)
 
-            total_views, views_organik, status, is_boosted_api = fetch_single(
-                url, loader, is_retry=False
-            )
+            total_views, views_organik, status, is_boosted_api = fetch_single_sequential(url, loader)
 
             if status == "stopped":
                 break
 
-            processed += 1
-            job_status["processed"] = processed
-            job_status["progress"]  = round(processed / limit * 100)
-
-            # ── KUNCI: jangan tulis 0 — tampung ke failed_queue ──
-            if status != "ok" or total_views == 0:
-                consec_ok = 0
-                failed_queue.append((idx, gs_row, url))
-                # Tandai PENDING agar baris tidak dianggap segar di run berikutnya
-                bulk_updates.append({
-                    "range":  f"'{req.sheet_name}'!{col_letter(col_status_idx)}{gs_row}",
-                    "values": [["[PENDING_RETRY]"]],
-                })
-                log(
-                    f"  ⚠️ [{processed}/{limit}] baris {gs_row} "
-                    f"→ {status} (antri retry) | jeda={delay:.1f}s"
-                )
+            # Update streak sukses
+            if status == "ok":
+                consecutive_success += 1
             else:
-                consec_ok += 1
+                consecutive_success = 0
 
-                is_boosted = is_boosted_api
-                if col_boost is not None and col_boost < len(data_rows[idx]):
-                    val = str(data_rows[idx][col_boost]).strip().lower()
-                    if val in {"yes", "y", "true", "boosting", "1"}:
-                        is_boosted    = True
-                        views_organik = int(total_views * 0.4) if total_views else 0
+            # Override dari kolom boost manual berdasarkan indeks baris memori asli yang tepat
+            is_boosted = is_boosted_api
+            if col_boost is not None and col_boost < len(data_rows[idx]):
+                val = str(data_rows[idx][col_boost]).strip().lower()
+                if val in {"yes", "y", "true", "boosting", "1"}:
+                    is_boosted    = True
+                    views_organik = int(total_views * 0.4) if total_views else 0
 
-                bulk_updates.extend(
-                    _build_row_updates(
-                        req.sheet_name, gs_row,
-                        total_views, views_organik, is_boosted,
-                        col_imp, col_imp_ori, col_status_idx,
-                    )
-                )
-                log(
-                    f"  ✓ [{processed}/{limit}] baris {gs_row} "
-                    f"→ {total_views:,} views | streak={consec_ok} | jeda={delay:.1f}s"
-                )
+            ts    = datetime.now(ZoneInfo("Asia/Jakarta")).strftime("%Y-%m-%d %H:%M:%S")
+            label = f"[BOOSTED] {ts}" if is_boosted else f"[ORGANIC] {ts}"
 
-            if processed % CHECKPOINT_AT == 0 and bulk_updates:
-                log(f"[CKPT] Menyimpan {len(bulk_updates)} cells...")
+            # Menembak koordinat penulisan Google Sheet secara presisi menggunakan gs_row bawaan
+            if col_imp is not None:
+                bulk_updates.append({
+                    "range":  f"'{req.sheet_name}'!{col_letter(col_imp)}{gs_row}",
+                    "values": [[_safe_int_val(total_views)]],
+                })
+            bulk_updates.append({
+                "range":  f"'{req.sheet_name}'!{col_letter(col_imp_ori)}{gs_row}",
+                "values": [[_safe_int_val(views_organik)]],
+            })
+            bulk_updates.append({
+                "range":  f"'{req.sheet_name}'!{col_letter(col_status_idx)}{gs_row}",
+                "values": [[label]],
+            })
+
+            processed_count += 1
+            job_status["processed"] = processed_count
+            job_status["progress"]  = round(processed_count / limit * 100)
+            log(f"  ✓ [{processed_count}/{limit}] baris {gs_row} | streak={consecutive_success} | jeda={delay:.1f}s → {label}")
+
+            # ── Checkpoint write ──
+            if processed_count % CHECKPOINT_EVERY == 0 and bulk_updates:
+                log(f"[CHECKPOINT] Menyimpan {len(bulk_updates)} cells...")
                 update_sheet_values(service, req.spreadsheet_id, bulk_updates)
                 bulk_updates = []
 
-            if processed % random.randint(8, 14) == 0 and processed < limit:
+            # Coffee break anti-ban otomatis
+            if processed_count % random.randint(8, 14) == 0 and processed_count < limit:
                 pause = random.uniform(15, 30) if limit <= 30 else random.uniform(25, 45)
                 log(f"☕ [ANTI-BAN] Istirahat {pause:.1f}s...")
                 time.sleep(pause)
 
-        # ── Flush sisa bulk pass utama ────────────────────────
+        # ── Simpan sisa data yang belum ter-checkpoint ──
         if bulk_updates:
-            log(f"[WRITE] Menyimpan {len(bulk_updates)} cells...")
+            log(f"[WRITE] Menyimpan {len(bulk_updates)} cells tersisa...")
             update_sheet_values(service, req.spreadsheet_id, bulk_updates)
-
-        log(
-            f"\n[JOB] Pass utama selesai — "
-            f"OK: {processed - len(failed_queue)}/{processed} | "
-            f"retry: {len(failed_queue)}"
-        )
-
-        # ════════════════════════════════════════════════════
-        # RETRY ROUNDS — dijalankan SETELAH semua hasil pass
-        # utama sudah ditulis ke spreadsheet
-        # ════════════════════════════════════════════════════
-        retry_queue = failed_queue[:]
-
-        for round_num in range(1, MAX_RETRY_ROUNDS + 1):
-            if not retry_queue:
-                log("[RETRY] Semua berhasil, tidak ada yang tersisa.")
-                break
-            if not job_status["running"]:
-                log("[RETRY] Job dihentikan.")
-                break
-
-            retry_queue = run_retry_round(
-                round_num=round_num,
-                retry_queue=retry_queue,
-                data_rows=data_rows,
-                service=service,
-                req=req,
-                col_imp=col_imp,
-                col_imp_ori=col_imp_ori,
-                col_status_idx=col_status_idx,
-                col_boost=col_boost,
-            )
-
-        # ── Tandai yang benar-benar tidak bisa diambil ───────
-        if retry_queue:
-            log(f"\n[FINAL] {len(retry_queue)} URL tetap gagal setelah semua retry.")
-            final_upd = []
-            for _, gs_row, url in retry_queue:
-                sc = extract_shortcode(url) or url
-                final_upd.append({
-                    "range":  f"'{req.sheet_name}'!{col_letter(col_status_idx)}{gs_row}",
-                    "values": [[f"[FAILED] {_wib_now_str()} | {sc}"]],
-                })
-            if final_upd:
-                update_sheet_values(service, req.spreadsheet_id, final_upd)
-                log(f"[FINAL] {len(final_upd)} baris ditandai [FAILED].")
+            log("[WRITE] Selesai.")
 
     except Exception as e:
         job_status["error"] = str(e)
         log(f"[ERROR] {e}")
     finally:
         job_status["running"]  = False
-        job_status["last_run"] = _wib_now_str()
-        log(f"\n[JOB] Selesai total pada {job_status['last_run']}")
+        job_status["last_run"] = datetime.now(ZoneInfo("Asia/Jakarta")).strftime("%Y-%m-%d %H:%M:%S")
 
 
 def trigger_automatic_job():
@@ -879,26 +561,6 @@ def trigger_automatic_job():
         return
     if not job_status["running"]:
         run_job(current_job_req)
-
-
-# ─── LIFESPAN ────────────────────────────────────────────────
-
-@asynccontextmanager
-async def lifespan(application: FastAPI):
-    if os.environ.get("INSTAGRAM_COOKIES"):
-        reset_loader()
-    yield
-    if scheduler.running:
-        scheduler.shutdown()
-
-
-app = FastAPI(title="IG View Worker", lifespan=lifespan)
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["https://analisis-data-instagram-fe.vercel.app"],
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
 
 
 # ─── ENDPOINTS ───────────────────────────────────────────────
@@ -923,9 +585,7 @@ async def save_instagram_session(payload: dict):
         if hf_token:
             try:
                 from huggingface_hub import HfApi
-                HfApi(token=hf_token).add_space_secret(
-                    repo_id=HF_REPO_ID, key="INSTAGRAM_COOKIES", value=cookies_json
-                )
+                HfApi(token=hf_token).add_space_secret(repo_id=HF_REPO_ID, key="INSTAGRAM_COOKIES", value=cookies_json)
             except Exception:
                 pass
 
@@ -941,31 +601,30 @@ async def spreadsheet_job(req: SpreadsheetRequest, background_tasks: BackgroundT
     _validate_session()
     if job_status["running"]:
         raise HTTPException(status_code=409, detail="Job sedang berjalan.")
+
     current_job_req = req
     background_tasks.add_task(run_job, req)
     _ensure_scheduler()
+
     return {
-        "message": "Job dimulai.",
+        "message":        "Job dimulai.",
         "spreadsheet_id": req.spreadsheet_id,
-        "sheet_name": req.sheet_name,
-        "status": "started",
+        "sheet_name":     req.sheet_name,
+        "status":         "started",
     }
 
 
 @app.get("/status")
 def get_status():
     return {
-        "running":         job_status["running"],
-        "progress":        job_status["progress"],
-        "processed":       job_status["processed"],
-        "total":           job_status["total"],
-        "last_run":        job_status["last_run"],
-        "error":           job_status["error"],
-        "log":             job_status["log"][-50:],
-        "session_active":  bool(os.environ.get("INSTAGRAM_COOKIES")),
-        "retry_round":     job_status["retry_round"],
-        "retry_total":     job_status["retry_total"],
-        "retry_processed": job_status["retry_processed"],
+        "running":        job_status["running"],
+        "progress":       job_status["progress"],
+        "processed":      job_status["processed"],
+        "total":          job_status["total"],
+        "last_run":       job_status["last_run"],
+        "error":          job_status["error"],
+        "log":            job_status["log"][-50:],
+        "session_active": bool(os.environ.get("INSTAGRAM_COOKIES")),
     }
 
 
@@ -993,16 +652,18 @@ async def restart_job(req: SpreadsheetRequest, background_tasks: BackgroundTasks
     _validate_session()
     if not req.spreadsheet_id.strip():
         raise HTTPException(status_code=400, detail="Spreadsheet ID tidak boleh kosong.")
+
     with job_lock:
         job_status["running"] = False
         time.sleep(1.0)
+
     current_job_req = req
     background_tasks.add_task(run_job, req)
     return {
-        "message": "Job di-restart.",
+        "message":        "Job di-restart.",
         "spreadsheet_id": req.spreadsheet_id,
-        "sheet_name": req.sheet_name,
-        "status": "restarted",
+        "sheet_name":     req.sheet_name,
+        "status":         "restarted",
     }
 
 
@@ -1022,9 +683,19 @@ def _ensure_scheduler():
     if not scheduler.get_job("automatic_ig_job"):
         if not scheduler.running:
             scheduler.start()
-        scheduler.add_job(
-            trigger_automatic_job, "interval", hours=24, id="automatic_ig_job"
-        )
+        scheduler.add_job(trigger_automatic_job, "interval", hours=24, id="automatic_ig_job")
+
+
+@app.on_event("startup")
+async def startup_event():
+    if os.environ.get("INSTAGRAM_COOKIES"):
+        reset_loader()
+
+
+@app.on_event("shutdown")
+async def shutdown_event():
+    if scheduler.running:
+        scheduler.shutdown()
 
 
 if __name__ == "__main__":

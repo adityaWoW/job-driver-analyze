@@ -906,6 +906,30 @@ async def save_instagram_session(payload: dict):
         return {"success": True, "message": "Session saved", "total": len(filtered)}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
+    
+@app.post("/api/instagram/save-session2")
+async def save_instagram_session(payload: dict):
+    try:
+        cookies  = payload.get("cookies", [])
+        filtered = [c for c in cookies if c.get("name") in IMPORTANT_COOKIES]
+        if not filtered:
+            raise HTTPException(status_code=400, detail="Tidak ada cookies valid")
+
+        cookies_json = json.dumps(filtered)
+        os.environ["INSTAGRAM_COOKIES"] = cookies_json
+
+        hf_token = os.environ.get("HF_TOKEN2")
+        if hf_token:
+            try:
+                from huggingface_hub import HfApi
+                HfApi(token=hf_token).add_space_secret(repo_id=HF_REPO_ID, key="INSTAGRAM_COOKIES", value=cookies_json)
+            except Exception:
+                pass
+
+        reset_loader()
+        return {"success": True, "message": "Session saved", "total": len(filtered)}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
 
 
 @app.post("/spreadSheet")

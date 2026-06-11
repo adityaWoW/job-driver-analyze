@@ -30,8 +30,8 @@ app.add_middleware(
 )
 
 # ─── CONSTANTS ───────────────────────────────────────────────
-IG_USERNAME       = "Ace.Shuttle"
-HF_REPO_ID        = "adityaUHU/job-driver"
+IG_USERNAME       = "cat_streat"
+HF_REPO_ID        = "adityaUHU/job-driver2"
 IMPORTANT_COOKIES = ["sessionid", "csrftoken", "ds_user_id", "ig_did", "mid"]
 
 MAX_FAIL_COUNT    = 3    

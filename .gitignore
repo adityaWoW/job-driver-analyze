@@ -1,0 +1,40 @@
+# Kredensial dan File Konfigurasi Sensitif (WAJIB)
+.env
+.env.local
+.env.*.local
+*.pem
+*.key
+*.json
+
+# Python (Cache dan Hasil Compile)
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+.htmlcov/
+htmlcov/
+
+# Virtual Environment (Python)
+venv/
+.venv/
+env/
+ENV/
+env.bak/
+venv.bak/
+
+# Editor / IDE (VS Code, PyCharm, dll)
+.vscode/
+.idea/
+*.suo
+*.ntvs*
+*.njsproj
+*.sln
+*.swp
+
+# Sistem Operasi (File Sampah OS)
+.DS_Store
+.DS_Store?
+Thumbs.db
+ehthumbs.db
+Log.txt
+*.log

@@ -1,8 +1,8 @@
-APScheduler>=3.10.4
-fastapi==0.136.3
-google_api_python_client==2.6.0
-huggingface_hub==1.16.4
+APScheduler==3.10.4
+fastapi==0.138.0
+google_api_python_client==2.197.0
 instaloader==4.15.1
-protobuf==7.35.0
-pydantic>=1.10.15
-uvicorn==0.48.0
+protobuf==7.35.1
+pydantic==1.10.15
+python-dotenv==1.2.2
+uvicorn==0.49.0

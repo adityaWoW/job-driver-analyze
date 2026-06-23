@@ -5,6 +5,8 @@ import random
 import threading
 import instaloader
 import re
+import ssl
+import socket
 
 from fastapi import FastAPI, HTTPException, BackgroundTasks
 from fastapi.middleware.cors import CORSMiddleware
@@ -13,10 +15,17 @@ from typing import Optional
 from apscheduler.schedulers.background import BackgroundScheduler
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
-from concurrent.futures import ThreadPoolExecutor, as_completed
 
 from google.oauth2 import service_account
 from googleapiclient.discovery import build
+
+from googleapiclient.discovery import build
+from googleapiclient.errors import HttpError
+from googleapiclient.discovery import build
+
+
+from dotenv import load_dotenv
+load_dotenv()
 
 scheduler = BackgroundScheduler()
 current_job_req = None
@@ -24,14 +33,14 @@ current_job_req = None
 app = FastAPI(title="IG View Worker")
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["https://analisis-data-instagram-fe.vercel.app"],
+    allow_origins=["*"],#https://analisis-data-instagram-fe.vercel.app", "http://localhost:3000
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
 # ─── CONSTANTS ───────────────────────────────────────────────
-IG_USERNAME       = "cat_streat"
-HF_REPO_ID        = "adityaUHU/job-driver2"
+IG_USERNAME       = "Ace.shuttle"
+# HF_REPO_ID        = "adityaUHU/job-driver2"
 IMPORTANT_COOKIES = ["sessionid", "csrftoken", "ds_user_id", "ig_did", "mid"]
 
 MAX_FAIL_COUNT    = 3    
@@ -454,14 +463,36 @@ def fetch_single(
 
 # ─── GOOGLE SHEETS ───────────────────────────────────────────
 
+# def get_sheets_service(creds_override: dict = None):
+#     creds_json = creds_override or json.loads(os.environ.get("GOOGLE_CREDENTIALS", "{}"))
+#     scopes = [
+#         "https://www.googleapis.com/auth/spreadsheets",
+#         "https://www.googleapis.com/auth/drive",
+#     ]
+#     creds = service_account.Credentials.from_service_account_info(creds_json, scopes=scopes)
+#     return build("sheets", "v4", credentials=creds)
+
 def get_sheets_service(creds_override: dict = None):
-    creds_json = creds_override or json.loads(os.environ.get("GOOGLE_CREDENTIALS", "{}"))
+    if creds_override:
+        creds_json = creds_override
+    else:
+        with open("storage/google_credentials.json") as f:
+            creds_json = json.load(f)
+
     scopes = [
         "https://www.googleapis.com/auth/spreadsheets",
         "https://www.googleapis.com/auth/drive",
     ]
-    creds = service_account.Credentials.from_service_account_info(creds_json, scopes=scopes)
-    return build("sheets", "v4", credentials=creds)
+    creds = service_account.Credentials.from_service_account_info(
+        creds_json, scopes=scopes
+    )   
+
+    # Force fresh session tiap kali, hindari stale SSL connection
+    return build(
+        "sheets", "v4",
+        credentials=creds,
+        cache_discovery=False,  # Hindari cache httplib2 yang bisa stale
+    )
 
 
 def get_sheet_values(service, spreadsheet_id: str, range_name: str):
@@ -473,13 +504,39 @@ def get_sheet_values(service, spreadsheet_id: str, range_name: str):
     return result.get("values", [])
 
 
-def update_sheet_values(service, spreadsheet_id: str, data_updates: list):
+# def update_sheet_values(service, spreadsheet_id: str, data_updates: list):
+#     if not data_updates:
+#         return
+#     service.spreadsheets().values().batchUpdate(
+#         spreadsheetId=spreadsheet_id,
+#         body={"valueInputOption": "USER_ENTERED", "data": data_updates},
+#     ).execute()
+
+def update_sheet_values(service, spreadsheet_id: str, data_updates: list, retries: int = 3):
     if not data_updates:
         return
-    service.spreadsheets().values().batchUpdate(
-        spreadsheetId=spreadsheet_id,
-        body={"valueInputOption": "USER_ENTERED", "data": data_updates},
-    ).execute()
+
+    for attempt in range(retries):
+        try:
+            service.spreadsheets().values().batchUpdate(
+                spreadsheetId=spreadsheet_id,
+                body={"valueInputOption": "USER_ENTERED", "data": data_updates},
+            ).execute()
+            return  # sukses
+
+        except (ssl.SSLError, ssl.SSLEOFError, socket.error, BrokenPipeError, ConnectionResetError) as e:
+            log(f"  ⚠️ SSL/Connection error saat write (attempt {attempt+1}/{retries}): {e}")
+            if attempt < retries - 1:
+                time.sleep(5 * (attempt + 1))  # backoff: 5s, 10s
+            else:
+                raise
+
+        except HttpError as e:
+            if e.resp.status in (429, 500, 503):
+                log(f"  ⚠️ Google API HTTP {e.resp.status} (attempt {attempt+1}/{retries})")
+                time.sleep(10 * (attempt + 1))
+            else:
+                raise
 
 
 def _build_row_updates(
@@ -644,6 +701,14 @@ def run_job(req: SpreadsheetRequest):
         loader  = get_loader()
 
         raw_rows = get_sheet_values(service, req.spreadsheet_id, f"'{req.sheet_name}'!A1:ZZ")
+        log(f"[DEBUG] raw_rows count: {len(raw_rows)}")
+        log(f"[DEBUG] sheet_name yang dikirim: '{req.sheet_name}'")
+        log(f"[DEBUG] spreadsheet_id: '{req.spreadsheet_id}'")
+        if raw_rows:
+            log(f"[DEBUG] Header row: {raw_rows[0]}")
+            log(f"[DEBUG] Total data rows: {len(raw_rows) - 1}")
+        else:
+            log("[DEBUG] raw_rows KOSONG — sheet tidak terbaca sama sekali")
         if not raw_rows:
             log("[JOB] Sheet kosong, skip.")
             return
@@ -883,6 +948,29 @@ def root():
     return {"status": "ok", "message": "IG View Worker is running"}
 
 
+# @app.post("/api/instagram/save-session")
+# async def save_instagram_session(payload: dict):
+#     try:
+#         cookies  = payload.get("cookies", [])
+#         filtered = [c for c in cookies if c.get("name") in IMPORTANT_COOKIES]
+#         if not filtered:
+#             raise HTTPException(status_code=400, detail="Tidak ada cookies valid")
+
+#         cookies_json = json.dumps(filtered)
+#         os.environ["INSTAGRAM_COOKIES"] = cookies_json
+
+#         hf_token = os.environ.get("HF_TOKEN")
+#         if hf_token:
+#             try:
+#                 from huggingface_hub import HfApi
+#                 HfApi(token=hf_token).add_space_secret(repo_id=HF_REPO_ID, key="INSTAGRAM_COOKIES", value=cookies_json)
+#             except Exception:
+#                 pass
+
+#         reset_loader()
+#         return {"success": True, "message": "Session saved", "total": len(filtered)}
+#     except Exception as e:
+#         raise HTTPException(status_code=500, detail=str(e))
 @app.post("/api/instagram/save-session")
 async def save_instagram_session(payload: dict):
     try:
@@ -892,44 +980,43 @@ async def save_instagram_session(payload: dict):
             raise HTTPException(status_code=400, detail="Tidak ada cookies valid")
 
         cookies_json = json.dumps(filtered)
+
+        # Simpan ke env runtime
         os.environ["INSTAGRAM_COOKIES"] = cookies_json
 
-        hf_token = os.environ.get("HF_TOKEN")
-        if hf_token:
-            try:
-                from huggingface_hub import HfApi
-                HfApi(token=hf_token).add_space_secret(repo_id=HF_REPO_ID, key="INSTAGRAM_COOKIES", value=cookies_json)
-            except Exception:
-                pass
+        # Simpan ke file lokal (persisten)
+        os.makedirs("storage", exist_ok=True)
+        with open("storage/cookies.json", "w") as f:
+            f.write(cookies_json)
 
         reset_loader()
         return {"success": True, "message": "Session saved", "total": len(filtered)}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
     
-@app.post("/api/instagram/save-session2")
-async def save_instagram_session(payload: dict):
-    try:
-        cookies  = payload.get("cookies", [])
-        filtered = [c for c in cookies if c.get("name") in IMPORTANT_COOKIES]
-        if not filtered:
-            raise HTTPException(status_code=400, detail="Tidak ada cookies valid")
+# @app.post("/api/instagram/save-session2")
+# async def save_instagram_session(payload: dict):
+#     try:
+#         cookies  = payload.get("cookies", [])
+#         filtered = [c for c in cookies if c.get("name") in IMPORTANT_COOKIES]
+#         if not filtered:
+#             raise HTTPException(status_code=400, detail="Tidak ada cookies valid")
 
-        cookies_json = json.dumps(filtered)
-        os.environ["INSTAGRAM_COOKIES"] = cookies_json
+#         cookies_json = json.dumps(filtered)
+#         os.environ["INSTAGRAM_COOKIES"] = cookies_json
 
-        hf_token = os.environ.get("HF_TOKEN2")
-        if hf_token:
-            try:
-                from huggingface_hub import HfApi
-                HfApi(token=hf_token).add_space_secret(repo_id=HF_REPO_ID, key="INSTAGRAM_COOKIES", value=cookies_json)
-            except Exception:
-                pass
+#         hf_token = os.environ.get("HF_TOKEN2")
+#         if hf_token:
+#             try:
+#                 from huggingface_hub import HfApi
+#                 HfApi(token=hf_token).add_space_secret(repo_id=HF_REPO_ID, key="INSTAGRAM_COOKIES", value=cookies_json)
+#             except Exception:
+#                 pass
 
-        reset_loader()
-        return {"success": True, "message": "Session saved", "total": len(filtered)}
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+#         reset_loader()
+#         return {"success": True, "message": "Session saved", "total": len(filtered)}
+#     except Exception as e:
+#         raise HTTPException(status_code=500, detail=str(e))
 
 
 @app.post("/spreadSheet")
